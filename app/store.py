@@ -33,6 +33,10 @@ CREATE TABLE IF NOT EXISTS scheduler_state (
     key TEXT PRIMARY KEY,            -- e.g. "last_request_at", "last_parse_at"
     value REAL NOT NULL              -- wall-clock epoch seconds
 );
+CREATE TABLE IF NOT EXISTS redirects (
+    src TEXT PRIMARY KEY,            -- requested title (or normalized form)
+    dst TEXT NOT NULL                -- canonical page title
+);
 """
 
 
@@ -66,6 +70,24 @@ class Store:
                 "INSERT INTO scheduler_state (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
+            )
+            self._conn.commit()
+
+    # -- redirect aliases -----------------------------------------------------
+
+    def get_redirect(self, src: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT dst FROM redirects WHERE src = ?", (src,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def save_redirect(self, src: str, dst: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO redirects (src, dst) VALUES (?, ?) "
+                "ON CONFLICT(src) DO UPDATE SET dst = excluded.dst",
+                (src, dst),
             )
             self._conn.commit()
 

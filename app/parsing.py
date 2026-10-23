@@ -29,12 +29,18 @@ _MONTHS = {
     "december": 12,
 }
 
-# Staff roles are excluded from teammate lists per PRD section 4.
-_STAFF_ROLES = {
-    "coach", "assistant coach", "position coach", "manager", "analyst",
-    "ceo", "owner", "streamer", "content creator", "caster", "host",
-}
+# Staff roles are excluded from teammate lists per PRD section 4. Matched by
+# keyword containment because wikis write "Interim Coach", "Assistant Coach",
+# "Data Analyst" and similar variants.
+_STAFF_KEYWORDS = (
+    "coach", "manager", "analyst", "ceo", "owner", "streamer",
+    "content creator", "caster", "host",
+)
 _SUBSTITUTE_ROLES = {"substitute", "sub", "stand-in", "standin"}
+
+
+def _is_staff_role(role_lower: str) -> bool:
+    return any(keyword in role_lower for keyword in _STAFF_KEYWORDS)
 
 _ROLE_ALIASES = {
     "in-game leader": "IGL", "igl": "IGL", "captain": "IGL",
@@ -404,7 +410,7 @@ def parse_squads(wikitext: str) -> list[SquadEntry]:
                 real_name=clean(params.get("name", "")) or None,
                 nationality=_FLAG_NAMES.get(clean(params.get("flag", "")).lower()),
                 roles=(["IGL"] if params.get("igl", "").strip().lower() == "y" else []),
-                staff=role_raw in _STAFF_ROLES,
+                staff=_is_staff_role(role_raw),
                 substitute=role_raw in _SUBSTITUTE_ROLES,
                 join=parse_date(params.get("joindate", "")),
                 leave=parse_date(params.get("leavedate", "")),

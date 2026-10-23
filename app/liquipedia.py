@@ -83,7 +83,9 @@ class LiquipediaClient:
 
     async def get_wikitext(self, title: str) -> PageContent:
         """Return cached wikitext when fresh; otherwise fetch one revision."""
-        cached = self._store.get_page(title)
+        # Resolve known redirects first so alias titles hit the page cache.
+        canonical = self._store.get_redirect(title) or title
+        cached = self._store.get_page(canonical)
         if cached and self._is_fresh(cached):
             return PageContent(
                 title=cached["title"], page_id=cached["page_id"],
@@ -108,7 +110,13 @@ class LiquipediaClient:
             "rvslots": "main", "titles": title, "redirects": "1", "format": "json",
         }
         data = await self._request(params)
-        pages = data.get("query", {}).get("pages", {})
+        query = data.get("query", {})
+        # Remember redirect/normalization chains so future lookups hit cache.
+        previous = title
+        for redirect in query.get("redirects", []) + query.get("normalized", []):
+            self._store.save_redirect(previous, redirect.get("to", previous))
+            previous = redirect.get("to", previous)
+        pages = query.get("pages", {})
         for page in pages.values():
             revisions = page.get("revisions") or []
             if "missing" in page or not revisions:

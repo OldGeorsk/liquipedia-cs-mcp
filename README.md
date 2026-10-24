@@ -1,4 +1,5 @@
 # liquipedia-cs-mcp
+English | [简体中文](README.zh-CN.md)
 
 - Local MCP server that looks up Counter-Strike players on [Liquipedia](https://liquipedia.net/counterstrike): 
 - profile, current teammates, and the teammates of the three most recent previous teams.
@@ -44,6 +45,6 @@ Register `http://127.0.0.1:8000/mcp` (Streamable HTTP) in your MCP client:
 
 ## Compliance design
 
-A single serialized scheduler paces every upstream request with randomized
-2.3–3.0 s spacing (above Liquipedia's 2 s floor) and persists the clock in
-SQLite; 429s honor `Retry-After`, and page budgets keep every job resumable.
+- A single serialized scheduler paces every upstream request with randomized
+- 2.3–3.0 s spacing (above Liquipedia's 2 s floor) and persists the clock in
+- SQLite; 429s honor `Retry-After`, and page budgets keep every job resumable.

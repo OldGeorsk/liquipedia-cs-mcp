@@ -8,3 +8,6 @@ data/
 # Private notes — never publish
 docs/
 AGENTS.md
+
+# Dev-only — kept local
+tests/

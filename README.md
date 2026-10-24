@@ -7,7 +7,7 @@
 
 ```bash
 python -m venv .venv
-.venv/Scripts/pip install -e ".[dev]"   # Windows; use .venv/bin/pip elsewhere
+.venv/Scripts/pip install -e .             # Windows; use .venv/bin/pip elsewhere
 .venv/Scripts/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
@@ -15,6 +15,8 @@ Register `http://127.0.0.1:8000/mcp` (Streamable HTTP) in your MCP client:
 
 - **ZCode** — `~/.zcode/cli/config.json` → `mcp.servers`
 - **Claude Desktop / Cursor** — the client's `mcpServers` config
+- **Codex CLI** — `~/.codex/config.toml` → `[mcp_servers.liquipedia-cs-mcp]` with the same `url`
+- **ChatGPT desktop** — Settings → Connectors → Advanced → enable Developer mode → Add connector
 
 ```json
 { "liquipedia-cs-mcp": { "type": "http", "url": "http://127.0.0.1:8000/mcp" } }

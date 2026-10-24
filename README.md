@@ -1,9 +1,7 @@
 # liquipedia-cs-mcp
 
-Local MCP server that looks up Counter-Strike players on
-[Liquipedia](https://liquipedia.net/counterstrike): profile, current
-teammates, and the teammates of the three most recent previous teams.
-MVP scope and rules live in `docs/PRD/`.
+- Local MCP server that looks up Counter-Strike players on [Liquipedia](https://liquipedia.net/counterstrike): 
+- profile, current teammates, and the teammates of the three most recent previous teams.
 
 ## Install
 

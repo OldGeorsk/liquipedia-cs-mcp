@@ -2,7 +2,7 @@
 English | [简体中文](README.zh-CN.md)
 
 - Local MCP server that looks up Counter-Strike players on [Liquipedia](https://liquipedia.net/counterstrike): 
-- profile, current teammates, and the teammates of the three most recent previous teams.
+- e.g. profile, current teammates, and the teammates of the three most recent previous teams.
 
 ## Install
 

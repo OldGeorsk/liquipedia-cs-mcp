@@ -2,7 +2,7 @@
 [English](README.md) | 简体中文
 
 - 本地 MCP 服务器,用于在 [Liquipedia](https://liquipedia.net/counterstrike) 上查询反恐精英(Counter-Strike)选手:
-- 个人资料、现队友,以及最近三支前队伍各自的队友。
+- e.g. 个人资料、现队友,以及最近三支前队伍各自的队友。
 
 ## 安装
 

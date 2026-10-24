@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 data/
 .env
+
+# Private notes — never publish
+docs/
+AGENTS.md

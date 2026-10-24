@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     # Upstream MediaWiki API endpoint of the Counter-Strike wiki.
     api_url: str = "https://liquipedia.net/counterstrike/api.php"
     # Real contact address, required by Liquipedia's User-Agent policy.
+    # Set yours in .env (LIQUIPEDIA_CONTACT=...); never commit a real address.
     contact: str = "you@example.com"
 
     # Randomized spacing between request starts: official floor is 2s, we add margin.

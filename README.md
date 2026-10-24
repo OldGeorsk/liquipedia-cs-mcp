@@ -35,7 +35,7 @@ Register `http://127.0.0.1:8000/mcp` (Streamable HTTP) in your MCP client:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `LIQUIPEDIA_CONTACT` | repo owner's e-mail | required contact in the User-Agent |
+| `LIQUIPEDIA_CONTACT` | *(set in `.env`)* | required contact in the User-Agent |
 | `LIQUIPEDIA_CACHE_TTL_SECONDS` | `86400` | page cache freshness |
 | `LIQUIPEDIA_PAGE_BUDGET_PER_JOB` | `30` | fresh pages per lookup job |
 | `LIQUIPEDIA_API_URL` | counterstrike wiki API | upstream endpoint |

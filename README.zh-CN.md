@@ -2,7 +2,8 @@
 [English](README.md) | 简体中文
 
 - 本地 MCP 服务器,用于在 [Liquipedia](https://liquipedia.net/counterstrike) 上查询反恐精英(Counter-Strike)选手:
-- e.g. 个人资料、现队友,以及最近三支前队伍各自的队友。
+- 个人资料、现队友,以及最近三支前队伍各自的队友;
+- 完整职业生涯履历(逐段带游戏项目标签),以及两名选手间的关系判定(经核验的共同效力、明文记载的亲属关系)。
 
 ## 安装
 
@@ -33,6 +34,8 @@ python -m venv .venv
 | `search_players` | `query`、`limit`(1–5) | 候选选手列表,含 `player_id` |
 | `get_player_network` | `player_id` | 缓存结果,或用于轮询的 `job_id` |
 | `get_lookup_result` | `job_id` | 状态/进度 + 结果(含 `sources`、时间戳、CC BY-SA 3.0 许可信息、`warnings`;未知字段返回 `null` 并附原因) |
+| `get_player_career` | `player_id` | 完整战队履历:每段效力的游戏标签(CS / CS:GO / CS2)、原始精度的日期、身份标注、改名归一后的战队名 |
+| `get_player_relationship` | `player_a`、`player_b` | 共同效力战队及核验过的重叠区间(`confirmed` / `unconfirmed` / `none`)、双方当时身份、明文记载的亲属关系(绝不推断) |
 
 ## 配置(环境变量,`LIQUIPEDIA_` 前缀)
 
@@ -48,3 +51,4 @@ python -m venv .venv
 - 唯一的串行调度器为所有上游请求设定随机 2.3–3.0 秒的间隔,高于 Liquipedia 官方 2 秒下限
 - 计时状态持久化到 SQLite,服务重启后不会重置
 - 429 响应遵守 `Retry-After`,页面预算保证每个任务都可断点续跑
+- 页面抓取按多标题批量执行(`titles=A|B|C`,单请求最多 10 个标题),一次完整关系网查询约 7 次上游请求,而非约 30 次

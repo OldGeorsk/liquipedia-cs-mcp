@@ -570,27 +570,36 @@ def _sentence_around(text: str, start: int, end: int) -> str:
     return sentence.strip()[:300]
 
 
+def scan_kinships(wikitext: str, source_page: str) -> list[KinshipRecord]:
+    """Every explicit family relation on a page, in pattern then text order.
+
+    Scans the prose once so a batch comparison can reuse the result for many
+    pairs instead of re-running the patterns per pair.
+    """
+    prose = _HTML_COMMENT.sub("", wikitext)
+    patterns = ((_KIN_POSSESSIVE, 1, 2), (_KIN_OF, 2, 1), (_KIN_PLAIN, 1, 2))
+    records: list[KinshipRecord] = []
+    for pattern, person_group, kin_group in patterns:
+        for match in pattern.finditer(prose):
+            records.append(KinshipRecord(
+                relation=match.group(kin_group).lower(),
+                person=clean(match.group(person_group)),
+                evidence=_sentence_around(prose, match.start(), match.end()),
+                source_page=source_page,
+            ))
+    return records
+
+
 def find_kinship(
     wikitext: str, other_names: set[str], source_page: str,
 ) -> KinshipRecord | None:
     """Explicitly stated family relation mentioning one of ``other_names``.
 
-    Scans possessive ("X's cousin") and "kin of X" patterns around wiki
-    links. Anything not literally written on the page returns None.
+    Anything not literally written on the page returns None.
     """
-    prose = _HTML_COMMENT.sub("", wikitext)
-    patterns = ((_KIN_POSSESSIVE, 1, 2), (_KIN_OF, 2, 1), (_KIN_PLAIN, 1, 2))
-    for pattern, person_group, kin_group in patterns:
-        for match in pattern.finditer(prose):
-            person_raw = clean(match.group(person_group))
-            if not _person_matches(person_raw, other_names):
-                continue
-            return KinshipRecord(
-                relation=match.group(kin_group).lower(),
-                person=person_raw,
-                evidence=_sentence_around(prose, match.start(), match.end()),
-                source_page=source_page,
-            )
+    for record in scan_kinships(wikitext, source_page):
+        if _person_matches(record.person, other_names):
+            return record
     return None
 
 

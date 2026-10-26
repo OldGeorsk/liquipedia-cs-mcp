@@ -79,11 +79,16 @@ class LiquipediaClient:
         self._http = http
         self._inflight: dict[str, asyncio.Task[PageContent]] = {}
 
-    async def search(self, query: str, limit: int) -> list[SearchHit]:
+    async def search(
+        self, query: str, limit: int, namespace: int | None = 0,
+    ) -> list[SearchHit]:
+        """Full-text search; default namespace 0 keeps players/tournaments down."""
         params = {
             "action": "query", "list": "search", "srsearch": query,
             "srlimit": str(limit), "sroffset": "0", "format": "json",
         }
+        if namespace is not None:
+            params["srnamespace"] = str(namespace)
         data = await self._request(params)
         hits: list[SearchHit] = []
         for item in data.get("query", {}).get("search", []):

@@ -12,12 +12,15 @@ from app.network import InvalidResource, PlayerNetworkService
 
 _INSTRUCTIONS = (
     "Liquipedia Counter-Strike lookup. "
-    "First call search_players to resolve a nickname to a player_id (page title). "
+    "First call search_players to resolve a nickname to a player_id (page title), "
+    "or search_teams to resolve a team name to a team page title. "
     "get_team_roster returns a team's current players and staff from the team page. "
     "get_player_network then get_lookup_result run the async teammate lookup; "
     "get_player_career returns a player's full recorded team history; "
     "get_player_relationship compares two players' histories for shared stints "
-    "and explicitly stated kinship. "
+    "and explicitly stated kinship; get_relationship_matrix does the same for "
+    "every cross-team pair in up to 5 rosters, or for an explicit player list, "
+    "in one call. "
     "Player tools reject team/tournament pages with isError and a concrete "
     "alternative; never treat an error as an empty result. "
     f"All text data is {LICENSE_NAME} via Liquipedia."
@@ -92,6 +95,40 @@ def build_server(
             ],
             "license": LICENSE_NAME,
             "license_url": LICENSE_URL,
+            "served_at": utcnow().isoformat(),
+        })
+
+    @server.tool()
+    async def search_teams(query: str, limit: int = 5) -> CallToolResult:
+        """Search Counter-Strike team pages by name.
+
+        Returns up to `limit` (1-10) team candidates; player, tournament and
+        disambiguation pages are filtered out. An exact title match leads the
+        list. An empty `candidates` list is a valid answer, not an error.
+        """
+        if not query or not query.strip():
+            return _invalid_argument("query must be a non-empty string")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 10:
+            return _invalid_argument("limit must be an integer between 1 and 10")
+
+        envelope = await service.search_teams(query.strip(), limit)
+        if envelope.status == JobStatus.FAILED and envelope.error is not None:
+            return _tool_error(envelope.error)
+        return _text({
+            "query": envelope.result.query,
+            "candidates": [
+                candidate.model_dump(mode="json")
+                for candidate in envelope.result.candidates
+            ],
+            "warnings": envelope.warnings,
+            "license": LICENSE_NAME,
+            "license_url": LICENSE_URL,
+            "sources": [
+                source.model_dump(mode="json") for source in envelope.sources
+            ],
+            "fetched_at": (
+                envelope.fetched_at.isoformat() if envelope.fetched_at else None
+            ),
             "served_at": utcnow().isoformat(),
         })
 
@@ -204,6 +241,48 @@ def build_server(
             return _tool_error(exc.as_error())
         if (error := _input_error(envelope)) is not None:
             return error
+        return _text(envelope.model_dump_json(indent=2))
+
+    @server.tool()
+    async def get_relationship_matrix(
+        teams: list[str] | None = None,
+        players: list[str] | None = None,
+        include_staff: bool = False,
+        include_non_overlapping: bool = False,
+        max_pairs: int = 300,
+    ) -> CallToolResult:
+        """Compare player relationships across several teams in one call.
+
+        Pass `teams` (2-5 team page titles) to compare every cross-team pair
+        of the current rosters, or `players` (2-20 player page titles) to
+        compare all pairs of an explicit list - never both. Results separate
+        confirmed overlaps, unconfirmed overlaps, kinship and same-team
+        different-period records; a missing player page yields `partial` with
+        `skipped`, while an invalid team or too many pairs is an error.
+        """
+        team_list = [t.strip() for t in (teams or []) if t and t.strip()]
+        player_list = [p.strip() for p in (players or []) if p and p.strip()]
+        if bool(team_list) == bool(player_list):
+            return _invalid_argument("provide exactly one of teams or players")
+        if team_list and not 2 <= len(team_list) <= 5:
+            return _invalid_argument("teams must contain 2 to 5 team page titles")
+        if player_list and not 2 <= len(player_list) <= 20:
+            return _invalid_argument("players must contain 2 to 20 player page titles")
+        if (
+            not isinstance(max_pairs, int) or isinstance(max_pairs, bool)
+            or not 1 <= max_pairs <= 500
+        ):
+            return _invalid_argument("max_pairs must be an integer between 1 and 500")
+
+        try:
+            envelope = await service.matrix(
+                team_list or None, player_list or None,
+                include_staff, include_non_overlapping, max_pairs,
+            )
+        except InvalidResource as exc:
+            return _tool_error(exc.as_error())
+        if envelope.status == JobStatus.FAILED and envelope.error is not None:
+            return _tool_error(envelope.error)
         return _text(envelope.model_dump_json(indent=2))
 
     return server

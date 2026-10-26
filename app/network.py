@@ -8,21 +8,26 @@ are free, which is what makes budget-exhausted jobs cheap to resume.
 import asyncio
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from app.config import Settings
-from app.liquipedia import LiquipediaClient, ProviderError, RateLimited, page_url
+from app.liquipedia import (
+    LiquipediaClient, PageContent, ProviderError, RateLimited, page_url,
+)
 from app.models import (
     CareerResult, CareerStint, Envelope, ErrorInfo, JobStatus, KinshipRecord,
-    NetworkResult, OmittedRecords, OverlapWindow, Player, PreviousTeamGroup,
+    MatrixConnection, MatrixResult, MatrixStats, MatrixTeam, NetworkResult,
+    OmittedRecords, OverlapWindow, Player, PreviousTeamGroup,
     RelationConfidence, RelationshipResult, RosterMember, RosterRelation,
-    SharedTeamRecord, Source, StaffMember, TeamInfo, TeamRosterResult,
-    TeamStatus, Teammate,
+    SameTeamNoOverlap, SharedTeamRecord, SkippedPlayer, Source, StaffMember,
+    TeamCandidate, TeamInfo, TeamRosterResult, TeamSearchResult, TeamStatus,
+    Teammate,
 )
 from app.parsing import (
-    SquadEntry, classify_page, date_bounds, find_kinship, first_active_squad,
-    name_key, other_names_for, overlap_verdict, parse_career, parse_player,
-    parse_squads, parse_team_history, recent_previous_teams,
+    SquadEntry, classify_page, date_bounds, first_active_squad, name_key,
+    other_names_for, overlap_verdict, parse_career, parse_player, parse_squads,
+    parse_team_history, recent_previous_teams, scan_kinships,
 )
 from app.store import Store
 
@@ -65,6 +70,16 @@ _STAFF_HINTS = ("coach", "manager", "analyst", "owner", "ceo")
 
 def _staff_identity(text: str) -> bool:
     return any(hint in text for hint in _STAFF_HINTS)
+
+
+@dataclass
+class _PageContext:
+    """One player page parsed once, reusable across many pair comparisons."""
+
+    page: PageContent
+    player: Player
+    stints: list[CareerStint]
+    kinships: list[KinshipRecord]
 
 
 class PlayerNetworkService:
@@ -280,15 +295,7 @@ class PlayerNetworkService:
         rows = parse_squads(page.wikitext)
         active = first_active_squad(rows)
         players = [r for r in active if not r.staff and r.nickname]
-        active_staff = [r for r in rows if r.kind == "staff" and r.section == "active"]
-        staff_rows: list[SquadEntry] = []
-        seen_staff: set[str] = set()
-        for row in [r for r in active if r.staff] + active_staff:
-            key = name_key(row.nickname or row.real_name or "")
-            if not key or key in seen_staff:
-                continue
-            seen_staff.add(key)
-            staff_rows.append(row)
+        staff_rows = self._active_staff(rows)
 
         warnings: list[str] = []
         if not active:
@@ -382,106 +389,42 @@ class PlayerNetworkService:
         """
         a_id, b_id = player_a.strip(), player_b.strip()
         if name_key(a_id) == name_key(b_id):
-            return Envelope(
-                status=JobStatus.FAILED,
-                error=ErrorInfo(code="same_player",
-                                message="player_a and player_b are the same"),
-            )
+            return self._failure("same_player", "player_a and player_b are the same")
         try:
             batch = await self._client.get_wikitext_many([a_id, b_id])
         except RateLimited as exc:
-            return Envelope(
-                status=JobStatus.FAILED,
-                error=ErrorInfo(code="rate_limited", message=str(exc)),
-            )
+            return self._failure("rate_limited", str(exc))
         except ProviderError as exc:
-            return Envelope(
-                status=JobStatus.FAILED,
-                error=ErrorInfo(code=exc.code, message=str(exc)),
-            )
+            return self._failure(exc.code, str(exc))
         missing = [t for t in (a_id, b_id) if t in batch.missing]
         if missing:
-            return Envelope(
-                status=JobStatus.FAILED,
-                error=ErrorInfo(
-                    code="page_missing",
-                    message=f"player page not found: {', '.join(missing)}",
-                    given=", ".join(missing),
-                ),
+            return self._failure(
+                "page_missing", f"player page not found: {', '.join(missing)}",
+                given=", ".join(missing),
             )
         a_page, b_page = batch.pages[a_id], batch.pages[b_id]
         self._require_player(a_page, a_id)
         self._require_player(b_page, b_id)
-        a_player = parse_player(a_page.wikitext, title=a_page.title, page_id=a_page.page_id,
-                                settings=self._settings, revision_id=a_page.revision_id,
-                                fetched_at=a_page.fetched_at)
-        b_player = parse_player(b_page.wikitext, title=b_page.title, page_id=b_page.page_id,
-                                settings=self._settings, revision_id=b_page.revision_id,
-                                fetched_at=b_page.fetched_at)
-        a_stints = parse_career(a_page.wikitext, self._settings)
-        b_stints = parse_career(b_page.wikitext, self._settings)
+        a_ctx, b_ctx = self._context(a_page), self._context(b_page)
 
-        records: list[SharedTeamRecord] = []
-        for a_stint in a_stints:
-            self._stamp_canonical(a_stint)
-            a_key = name_key(self._store.canonical_title(a_stint.team.name))
-            for b_stint in b_stints:
-                self._stamp_canonical(b_stint)
-                b_key = name_key(self._store.canonical_title(b_stint.team.name))
-                if a_key != b_key or not a_key:
-                    continue
-                overlap = self._overlap_window(a_stint, b_stint)
-                playing = self._playing_together(
-                    a_player, b_player, a_stint, b_stint
-                ) and overlap.verdict != "none"
-                records.append(SharedTeamRecord(
-                    team=a_stint.team,
-                    canonical_team=(a_stint.canonical_team or b_stint.canonical_team),
-                    a_stint=a_stint, b_stint=b_stint,
-                    overlap=overlap, playing_together=playing,
-                    games=sorted({g for g in (a_stint.game, b_stint.game) if g != "unknown"}),
-                ))
-        records.sort(key=lambda r: (name_key(r.team.name),
-                                    r.a_stint.start.raw if r.a_stint.start else ""))
-
+        records = self._pair_records(a_ctx, b_ctx)
         omitted = [r for r in records if r.overlap.verdict == "none"]
         visible = records if include_non_overlapping else [
             r for r in records if r.overlap.verdict != "none"
         ]
+        kinship = self._pair_kinship(a_ctx, b_ctx)
 
-        kinship = find_kinship(
-            a_page.wikitext, other_names_for(b_player, b_page.title), a_page.title,
-        ) or find_kinship(
-            b_page.wikitext, other_names_for(a_player, a_page.title), b_page.title,
-        )
-        confirmed = sum(1 for r in visible if r.overlap.verdict == "confirmed")
-        unconfirmed = sum(1 for r in visible if r.overlap.verdict == "unconfirmed")
         warnings = []
-        if not a_stints:
-            warnings.append(f"no team history recorded for {a_player.nickname}")
-        if not b_stints:
-            warnings.append(f"no team history recorded for {b_player.nickname}")
+        if not a_ctx.stints:
+            warnings.append(f"no team history recorded for {a_ctx.player.nickname}")
+        if not b_ctx.stints:
+            warnings.append(f"no team history recorded for {b_ctx.player.nickname}")
         if not visible and not kinship:
             warnings.append("no shared team records found; this is not proof of no relation")
-        if confirmed:
-            summary = (
-                f"{confirmed} confirmed shared stint(s) at "
-                f"{len({name_key(r.team.name) for r in visible if r.overlap.verdict == 'confirmed'})} team(s)"
-            )
-        elif unconfirmed:
-            summary = (
-                f"no confirmed shared stints; {unconfirmed} stint(s) with "
-                f"unconfirmed overlap at {len({name_key(r.team.name) for r in visible})} team(s)"
-            )
-        elif kinship:
-            summary = "no shared team records found; an explicit kinship relation is recorded"
-        else:
-            summary = "no overlapping shared stints found"
-        fetched = max(x.fetched_at for x in (a_page, b_page))
         return Envelope(
             status=JobStatus.COMPLETE,
             result=RelationshipResult(
-                player_a=a_player, player_b=b_player,
+                player_a=a_ctx.player, player_b=b_ctx.player,
                 shared_teams=visible,
                 omitted=(
                     None if include_non_overlapping or not omitted
@@ -490,12 +433,298 @@ class PlayerNetworkService:
                         reason="shared team(s) without an overlapping stint",
                     )
                 ),
-                kinship=kinship, summary=summary,
+                kinship=kinship, summary=self._summarize(visible, kinship),
             ),
-            fetched_at=fetched,
-            sources=self._sources_of(a_player) + self._sources_of(b_player),
+            fetched_at=max(x.fetched_at for x in (a_page, b_page)),
+            sources=self._sources_of(a_ctx.player) + self._sources_of(b_ctx.player),
             warnings=warnings,
         )
+
+    async def search_teams(self, query: str, limit: int = 5) -> Envelope:
+        """Find team pages by name; player/tournament pages are filtered out.
+
+        One search request plus one batched page fetch when the candidates
+        are not cached yet; cached pages cost no upstream request.
+        """
+        query = query.strip()
+        try:
+            hits = await self._client.search(query, limit)
+        except RateLimited as exc:
+            return self._failure("rate_limited", str(exc), query)
+        except ProviderError as exc:
+            return self._failure("upstream_error", str(exc), query)
+
+        warnings: list[str] = []
+        if not hits:
+            warnings.append(
+                f"no search results for '{query}'; try the exact team page title"
+            )
+            return Envelope(
+                status=JobStatus.COMPLETE, result=TeamSearchResult(query=query),
+                warnings=warnings,
+            )
+        try:
+            batch = await self._client.get_wikitext_many([h.title for h in hits])
+        except RateLimited as exc:
+            return self._failure("rate_limited", str(exc), query)
+        except ProviderError as exc:
+            return self._failure("upstream_error", str(exc), query)
+
+        candidates: list[TeamCandidate] = []
+        sources: list[Source] = []
+        seen: set[str] = set()
+        for hit in hits:
+            page = batch.pages.get(hit.title)
+            if page is None or classify_page(page.wikitext) != "team":
+                continue
+            key = name_key(page.title)
+            if key in seen:  # redirects collapse into one canonical team page
+                continue
+            seen.add(key)
+            candidates.append(TeamCandidate(
+                team_id=page.title, name=page.title, page_id=page.page_id,
+                url=page_url(self._settings, page.title), snippet=hit.snippet,
+            ))
+            sources.append(self._source_of_page(page))
+        # Search ranking is noisy: an exact title match should always lead.
+        candidates.sort(key=lambda c: 0 if name_key(c.name) == name_key(query) else 1)
+        if not candidates:
+            warnings.append(
+                f"no team pages among {len(hits)} search result(s); "
+                "try the exact team page title"
+            )
+        return Envelope(
+            status=JobStatus.COMPLETE,
+            result=TeamSearchResult(query=query, candidates=candidates),
+            fetched_at=max((s.fetched_at for s in sources if s.fetched_at), default=None),
+            sources=sources, warnings=warnings,
+        )
+
+    async def matrix(
+        self,
+        teams: list[str] | None = None,
+        players: list[str] | None = None,
+        include_staff: bool = False,
+        include_non_overlapping: bool = False,
+        max_pairs: int = 300,
+    ) -> Envelope:
+        """Compare every cross-team player pair in one call (PRD P0-02).
+
+        Team and player pages are fetched in batches, each player page is
+        parsed once, and pairs are compared locally: the upstream request
+        count never grows with the number of pairs.
+        """
+        team_titles = [t.strip() for t in (teams or []) if t and t.strip()]
+        player_titles = list(dict.fromkeys(
+            p.strip() for p in (players or []) if p and p.strip()
+        ))
+        if bool(team_titles) == bool(player_titles):
+            return self._failure(
+                "invalid_argument", "provide exactly one of teams or players"
+            )
+
+        warnings: list[str] = []
+        skipped: list[SkippedPlayer] = []
+        sources: list[Source] = []
+        matrix_teams: list[MatrixTeam] = []
+        requested: list[str] = []
+
+        if team_titles:
+            try:
+                batch = await self._client.get_wikitext_many(team_titles)
+            except RateLimited as exc:
+                return self._failure("rate_limited", str(exc))
+            except ProviderError as exc:
+                return self._failure("upstream_error", str(exc))
+            missing = [t for t in team_titles if t in batch.missing]
+            if missing:
+                return self._failure(
+                    "page_missing", f"team page not found: {', '.join(missing)}",
+                    given=", ".join(missing),
+                )
+            for title in team_titles:
+                page = batch.pages[title]
+                self._require_team(page, title)
+                rows = parse_squads(page.wikitext)
+                active = first_active_squad(rows)
+                ids = [
+                    self._row_title(row)
+                    for row in active if not row.staff and row.nickname
+                ]
+                ids = [pid for pid in ids if pid]
+                for pid in ids:
+                    if pid not in requested:
+                        requested.append(pid)
+                if not ids:
+                    warnings.append(
+                        f"no active player squad found on the team page: {page.title}"
+                    )
+                matrix_teams.append(MatrixTeam(
+                    team=TeamInfo(
+                        name=page.title, page_id=page.page_id,
+                        url=page_url(self._settings, page.title),
+                    ),
+                    players=list(dict.fromkeys(ids)),
+                    staff=(
+                        [
+                            row.nickname or row.real_name or "unknown"
+                            for row in self._active_staff(rows)
+                        ] if include_staff else []
+                    ),
+                ))
+                sources.append(self._source_of_page(page))
+        else:
+            requested = player_titles
+
+        try:
+            batch = (
+                await self._client.get_wikitext_many(requested) if requested else None
+            )
+        except RateLimited as exc:
+            return self._failure("rate_limited", str(exc))
+        except ProviderError as exc:
+            return self._failure("upstream_error", str(exc))
+        pages = batch.pages if batch else {}
+
+        contexts: dict[str, _PageContext] = {}
+        alias: dict[str, str] = {}
+        for title in requested:
+            page = pages.get(title)
+            if page is None:
+                skipped.append(SkippedPlayer(
+                    player=title, given=title, reason="player page not found",
+                ))
+                continue
+            kind = classify_page(page.wikitext)
+            if kind != "player":
+                skipped.append(SkippedPlayer(
+                    player=page.title, given=title,
+                    reason=f"page is a {kind} page, not a player page",
+                ))
+                continue
+            contexts[page.title] = self._context(page)
+            alias[title] = page.title
+            sources.append(self._source_of_page(page))
+        for team in matrix_teams:
+            team.players = list(dict.fromkeys(
+                alias[pid] for pid in team.players if pid in alias
+            ))
+        for item in skipped:
+            warnings.append(f"skipped {item.player}: {item.reason}")
+
+        player_ids = list(contexts)
+        if len(player_ids) < 2:
+            return self._failure(
+                "insufficient_players",
+                f"need at least 2 comparable player pages; found {len(player_ids)}",
+                given=", ".join(item.player for item in skipped) or None,
+            )
+
+        # Cross-team pairs only: teammates inside one roster are not the task.
+        team_of: dict[str, list[str]] = {}
+        for team in matrix_teams:
+            for pid in team.players:
+                names = team_of.setdefault(pid, [])
+                if team.team.name not in names:
+                    names.append(team.team.name)
+        pairs = [
+            (a, b)
+            for index, a in enumerate(player_ids)
+            for b in player_ids[index + 1:]
+            if not team_titles or set(team_of.get(a, [])) != set(team_of.get(b, []))
+        ]
+        if len(pairs) > max_pairs:
+            return self._failure(
+                "matrix_too_large",
+                f"{len(pairs)} pairs exceed max_pairs={max_pairs}; "
+                "reduce teams/players or raise max_pairs",
+            )
+
+        ordered: list[tuple[int, int, MatrixConnection]] = []
+        no_overlap: list[SameTeamNoOverlap] = []
+        confirmed_pairs = unconfirmed_pairs = kinship_pairs = 0
+        for index, (a_id, b_id) in enumerate(pairs):
+            a_ctx, b_ctx = contexts[a_id], contexts[b_id]
+            records = self._pair_records(a_ctx, b_ctx)
+            kinship = self._pair_kinship(a_ctx, b_ctx)
+            confirmed = [r for r in records if r.overlap.verdict == "confirmed"]
+            unconfirmed = [r for r in records if r.overlap.verdict == "unconfirmed"]
+            none_records = [r for r in records if r.overlap.verdict == "none"]
+            visible = records if include_non_overlapping else confirmed + unconfirmed
+            from_teams: list[str] = []
+            for pid in (a_id, b_id):
+                for name in team_of.get(pid, []):
+                    if name not in from_teams:
+                        from_teams.append(name)
+            if visible or kinship:
+                connection = MatrixConnection(
+                    players=[a_id, b_id], from_teams=from_teams,
+                    summary=self._summarize(visible, kinship),
+                    shared_teams=visible,
+                    omitted=(
+                        OmittedRecords(
+                            count=len(none_records),
+                            reason="shared team(s) without an overlapping stint",
+                        ) if none_records and not include_non_overlapping else None
+                    ),
+                    kinship=kinship,
+                )
+                # Strongest verdict first; pair order keeps the output stable.
+                priority = 0 if confirmed else 1 if unconfirmed else 2
+                ordered.append((priority, index, connection))
+                if confirmed:
+                    confirmed_pairs += 1
+                elif unconfirmed:
+                    unconfirmed_pairs += 1
+                if kinship:
+                    kinship_pairs += 1
+            elif none_records:
+                if include_non_overlapping:
+                    ordered.append((3, index, MatrixConnection(
+                        players=[a_id, b_id], from_teams=from_teams,
+                        summary=self._summarize(none_records, None),
+                        shared_teams=none_records,
+                    )))
+                else:
+                    no_overlap.append(SameTeamNoOverlap(
+                        players=[a_id, b_id], from_teams=from_teams,
+                        teams=list(dict.fromkeys(
+                            r.canonical_team or r.team.name for r in none_records
+                        )),
+                        count=len(none_records),
+                    ))
+        connections = [
+            connection for _, _, connection in sorted(
+                ordered, key=lambda item: (item[0], item[1])
+            )
+        ]
+        if not connections and not no_overlap:
+            warnings.append(
+                f"no shared team records found among {len(pairs)} pair(s); "
+                "this is not proof of no relation"
+            )
+        return Envelope(
+            status=JobStatus.PARTIAL if skipped else JobStatus.COMPLETE,
+            result=MatrixResult(
+                mode="teams" if team_titles else "players",
+                teams=matrix_teams,
+                players_checked=len(player_ids),
+                pairs_checked=len(pairs),
+                connections=connections,
+                same_team_no_overlap=no_overlap,
+                stats=MatrixStats(
+                    connections=len(connections),
+                    confirmed_pairs=confirmed_pairs,
+                    unconfirmed_only_pairs=unconfirmed_pairs,
+                    kinship_pairs=kinship_pairs,
+                    same_team_no_overlap_pairs=len(no_overlap),
+                ),
+                skipped=skipped,
+            ),
+            fetched_at=max((s.fetched_at for s in sources if s.fetched_at), default=None),
+            sources=sources, warnings=warnings, truncated=bool(skipped),
+        )
+
 
     # -- job execution --------------------------------------------------------
 
@@ -775,6 +1004,105 @@ class PlayerNetworkService:
     def _sources_of(player: Player) -> list[Source]:
         return list(player.sources)
 
+    def _context(self, page) -> _PageContext:
+        """Parse a player page once; a matrix reuses it for every pair."""
+        player = parse_player(
+            page.wikitext, title=page.title, page_id=page.page_id,
+            settings=self._settings, revision_id=page.revision_id,
+            fetched_at=page.fetched_at,
+        )
+        stints = parse_career(page.wikitext, self._settings)
+        for stint in stints:
+            self._stamp_canonical(stint)
+        return _PageContext(
+            page=page, player=player, stints=stints,
+            kinships=scan_kinships(page.wikitext, page.title),
+        )
+
+    def _pair_records(
+        self, a: _PageContext, b: _PageContext,
+    ) -> list[SharedTeamRecord]:
+        """Every team both contexts list, with the verified overlap verdict."""
+        records: list[SharedTeamRecord] = []
+        for a_stint in a.stints:
+            a_key = name_key(a_stint.canonical_team or a_stint.team.name)
+            for b_stint in b.stints:
+                b_key = name_key(b_stint.canonical_team or b_stint.team.name)
+                if a_key != b_key or not a_key:
+                    continue
+                overlap = self._overlap_window(a_stint, b_stint)
+                playing = self._playing_together(
+                    a.player, b.player, a_stint, b_stint
+                ) and overlap.verdict != "none"
+                records.append(SharedTeamRecord(
+                    team=a_stint.team,
+                    canonical_team=(a_stint.canonical_team or b_stint.canonical_team),
+                    a_stint=a_stint, b_stint=b_stint,
+                    overlap=overlap, playing_together=playing,
+                    games=sorted({g for g in (a_stint.game, b_stint.game) if g != "unknown"}),
+                ))
+        records.sort(key=lambda r: (name_key(r.team.name),
+                                    r.a_stint.start.raw if r.a_stint.start else ""))
+        return records
+
+    @staticmethod
+    def _pair_kinship(
+        a: _PageContext, b: _PageContext,
+    ) -> KinshipRecord | None:
+        """Explicit kinship recorded on either page about the other player."""
+        b_names = other_names_for(b.player, b.page.title)
+        for record in a.kinships:
+            if name_key(record.person) in b_names:
+                return record
+        a_names = other_names_for(a.player, a.page.title)
+        for record in b.kinships:
+            if name_key(record.person) in a_names:
+                return record
+        return None
+
+    @staticmethod
+    def _summarize(
+        visible: list[SharedTeamRecord], kinship: KinshipRecord | None,
+    ) -> str:
+        """One non-empty sentence describing a pair; shared by both tools."""
+        confirmed = sum(1 for r in visible if r.overlap.verdict == "confirmed")
+        unconfirmed = sum(1 for r in visible if r.overlap.verdict == "unconfirmed")
+        if confirmed:
+            return (
+                f"{confirmed} confirmed shared stint(s) at "
+                f"{len({name_key(r.team.name) for r in visible if r.overlap.verdict == 'confirmed'})} team(s)"
+            )
+        if unconfirmed:
+            return (
+                f"no confirmed shared stints; {unconfirmed} stint(s) with "
+                f"unconfirmed overlap at {len({name_key(r.team.name) for r in visible})} team(s)"
+            )
+        if kinship:
+            return "no shared team records found; an explicit kinship relation is recorded"
+        return "no overlapping shared stints found"
+
+    @staticmethod
+    def _failure(code: str, message: str, given: str | None = None) -> Envelope:
+        return Envelope(
+            status=JobStatus.FAILED,
+            error=ErrorInfo(code=code, message=message, given=given),
+        )
+
+    def _active_staff(self, rows: list[SquadEntry]) -> list[SquadEntry]:
+        """Active staff from the roster table and the separate staff table."""
+        staff_rows: list[SquadEntry] = []
+        seen: set[str] = set()
+        active = first_active_squad(rows)
+        for row in [r for r in active if r.staff] + [
+            r for r in rows if r.kind == "staff" and r.section == "active"
+        ]:
+            key = name_key(row.nickname or row.real_name or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            staff_rows.append(row)
+        return staff_rows
+
     def _source_of_page(self, page) -> Source:
         return Source(
             page=page.title, page_id=page.page_id,
@@ -810,12 +1138,12 @@ class PlayerNetworkService:
             )
         elif kind in ("tournament", "disambiguation"):
             suggestion = (
-                f'use search_players(query="{given}") to resolve the title first '
+                f'use search_teams(query="{given}") to find a team page '
                 f'(this is a {kind} page)'
             )
         else:
             suggestion = (
-                f'use search_players(query="{given}") to resolve the page title first'
+                f'use search_teams(query="{given}") to resolve the page title first'
             )
         raise InvalidResource(given, kind, "team", suggestion)
 

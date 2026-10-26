@@ -190,6 +190,23 @@ class TeamRosterResult(BaseModel):
     staff: list[StaffMember] = Field(default_factory=list)
 
 
+class TeamCandidate(BaseModel):
+    """One team page returned by search_teams."""
+
+    team_id: str                     # canonical page title, safe for team_id
+    name: str
+    page_id: int | None = None
+    url: str
+    snippet: str = ""
+
+
+class TeamSearchResult(BaseModel):
+    """The payload of search_teams."""
+
+    query: str
+    candidates: list[TeamCandidate] = Field(default_factory=list)
+
+
 class OverlapWindow(BaseModel):
     """Verified overlap between two stints (PRD feature 2)."""
 
@@ -238,6 +255,65 @@ class RelationshipResult(BaseModel):
     summary: str
 
 
+class MatrixTeam(BaseModel):
+    """One team taking part in a relationship matrix."""
+
+    team: TeamInfo
+    players: list[str] = Field(default_factory=list)  # player page titles compared
+    staff: list[str] = Field(default_factory=list)    # shown only when requested
+
+
+class MatrixConnection(BaseModel):
+    """A player pair worth reporting: shared stints, kinship, or both."""
+
+    players: list[str] = Field(default_factory=list)
+    from_teams: list[str] = Field(default_factory=list)  # canonical team names
+    summary: str
+    shared_teams: list[SharedTeamRecord] = Field(default_factory=list)
+    omitted: OmittedRecords | None = None
+    kinship: KinshipRecord | None = None
+
+
+class SameTeamNoOverlap(BaseModel):
+    """A pair whose only shared teams were played at different times."""
+
+    players: list[str] = Field(default_factory=list)
+    from_teams: list[str] = Field(default_factory=list)
+    teams: list[str] = Field(default_factory=list)   # shared team names
+    count: int                                       # shared-team records
+
+
+class MatrixStats(BaseModel):
+    """Pair counts that make a matrix result auditable."""
+
+    connections: int = 0
+    confirmed_pairs: int = 0
+    unconfirmed_only_pairs: int = 0
+    kinship_pairs: int = 0
+    same_team_no_overlap_pairs: int = 0
+
+
+class SkippedPlayer(BaseModel):
+    """A roster player that could not be compared, with the reason."""
+
+    player: str
+    given: str | None = None
+    reason: str
+
+
+class MatrixResult(BaseModel):
+    """The payload of get_relationship_matrix (teams or players mode)."""
+
+    mode: str                        # teams / players
+    teams: list[MatrixTeam] = Field(default_factory=list)
+    players_checked: int = 0
+    pairs_checked: int = 0
+    connections: list[MatrixConnection] = Field(default_factory=list)
+    same_team_no_overlap: list[SameTeamNoOverlap] = Field(default_factory=list)
+    stats: MatrixStats = Field(default_factory=MatrixStats)
+    skipped: list[SkippedPlayer] = Field(default_factory=list)
+
+
 class ErrorInfo(BaseModel):
     """Machine-readable failure, separate from data-missing warnings."""
 
@@ -255,7 +331,8 @@ class Envelope(BaseModel):
     job_id: str | None = None
     player_id: str | None = None
     result: (
-        NetworkResult | CareerResult | RelationshipResult | TeamRosterResult | None
+        NetworkResult | CareerResult | RelationshipResult | TeamRosterResult
+        | TeamSearchResult | MatrixResult | None
     ) = None
     progress: str | None = None
     fetched_at: datetime | None = None

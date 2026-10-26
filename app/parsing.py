@@ -16,13 +16,23 @@ from dataclasses import dataclass, field
 
 from app.config import Settings
 from app.models import (
-    DateValue, Player, Source, TeamRef, TeamStatus, Tenure,
+    CareerStint, DateValue, KinshipRecord, Player, Source, TeamRef, TeamStatus,
+    Tenure,
 )
 
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 _WIKI_MARKUP = re.compile(r"'{2,3}|<[^>]+>")
-_TH_LINE = re.compile(r"\{\{TH\|([^|}]+)\|([^|}]+?)(?:\|[^|}]*)?\}\}")
-_PERSON_ROW = re.compile(r"\{\{Person\|(.*?)\}\}")
+# TH rows: {{TH|start — end|Team|annotation}}; template name is case-insensitive.
+_TH_ENTRY = re.compile(r"\{\{[Tt][Hh]\|([^|}]+)\|([^|}]+?)(?:\|([^}]*))?\}\}")
+_PERSON_ROW = re.compile(r"\{\{[Pp]erson\|(.*?)\}\}")
+
+# Game section headers inside team_history, longest prefix first.
+_GAME_TAGS = [
+    ("counter-strike: global offensive", "CS:GO"),
+    ("counter-strike: source", "CS:S"),
+    ("counter-strike 2", "CS2"),
+    ("counter-strike", "CS"),
+]
 _MONTHS = {
     "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
     "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
@@ -74,8 +84,13 @@ def clean(value: str) -> str:
 
 
 def extract_template(wikitext: str, name: str) -> str | None:
-    """Return the inner text of the first ``{{name ...}}`` (balanced braces)."""
-    start = wikitext.find("{{" + name)
+    """Return the inner text of the first ``{{name ...}}`` (balanced braces).
+
+    Template names are matched case-insensitively: MediaWiki treats
+    ``{{infobox player}}`` and ``{{Infobox player}}`` as the same template.
+    """
+    lowered = wikitext.lower()
+    start = lowered.find("{{" + name.lower())
     if start < 0:
         return None
     depth, i = 0, start
@@ -309,13 +324,44 @@ def parse_player(
     )
 
 
+def _game_tag(line: str) -> str | None:
+    text = clean(line).lower().strip(": ")
+    for prefix, tag in _GAME_TAGS:
+        if text.startswith(prefix):
+            return tag
+    return None
+
+
+def _scan_team_history(history_raw: str) -> list[tuple[str, str, str, str]]:
+    """Every TH entry as (span, team, annotation, game), in page order.
+
+    Game section headers ('''Counter-Strike 2''' etc.) tag the entries that
+    follow them, so stints never lose their game project.
+    """
+    entries: list[tuple[str, str, str, str]] = []
+    game = "unknown"
+    for line in _HTML_COMMENT.sub("", history_raw).splitlines():
+        tag = _game_tag(line)
+        if tag:
+            game = tag
+        # A header may be fused to its first TH row by a removed HTML comment,
+        # so the TH scan must not be skipped on header lines.
+        match = _TH_ENTRY.search(line)
+        if match:
+            entries.append((
+                match.group(1), match.group(2), clean(match.group(3) or ""), game,
+            ))
+    return entries
+
+
 def parse_team_history(wikitext: str, settings: Settings) -> list[Tenure]:
     """All stints from the infobox ``team_history``, oldest first as on page."""
     block = extract_template(wikitext, "Infobox player") or ""
     params = parse_template_params(block)
-    history_raw = params.get("team_history", "")
     tenures: list[Tenure] = []
-    for span, team_raw in _TH_LINE.findall(_HTML_COMMENT.sub("", history_raw)):
+    for span, team_raw, _annotation, _game in _scan_team_history(
+        params.get("team_history", "")
+    ):
         start_raw, _, end_raw = span.partition("—")
         end_text = clean(end_raw)
         still_there = end_text.lower() == "present"
@@ -331,6 +377,35 @@ def parse_team_history(wikitext: str, settings: Settings) -> list[Tenure]:
             )
         )
     return tenures
+
+
+def parse_career(wikitext: str, settings: Settings) -> list[CareerStint]:
+    """The complete recorded team history, oldest first (PRD feature 1).
+
+    Keeps game tags, stint annotations (inactive / stand-in / ...), date
+    precision and the 'Present' marker — nothing is normalized away.
+    """
+    from app.liquipedia import page_url
+
+    block = extract_template(wikitext, "Infobox player") or ""
+    params = parse_template_params(block)
+    stints: list[CareerStint] = []
+    for span, team_raw, annotation, game in _scan_team_history(
+        params.get("team_history", "")
+    ):
+        start_raw, _, end_raw = span.partition("—")
+        end_text = clean(end_raw)
+        ongoing = end_text.lower() == "present"
+        team_name = clean(team_raw)
+        stints.append(CareerStint(
+            team=TeamRef(name=team_name, url=page_url(settings, team_name)),
+            game=game,
+            start=parse_date(start_raw),
+            end=None if ongoing else parse_date(end_text),
+            ongoing=ongoing,
+            identity=annotation.lower() or None,
+        ))
+    return stints
 
 
 def recent_previous_teams(tenures: list[Tenure], current_team: str | None, limit: int = 3):
@@ -389,7 +464,7 @@ def parse_squads(wikitext: str) -> list[SquadEntry]:
     entries: list[SquadEntry] = []
     section = "none"
     for line in wikitext.splitlines():
-        squad = re.search(r"\{\{Squad\|status=(\w+)", line)
+        squad = re.search(r"\{\{[Ss]quad\|status=(\w+)", line)
         if squad:
             section = squad.group(1)
             continue
@@ -418,3 +493,79 @@ def parse_squads(wikitext: str) -> list[SquadEntry]:
             )
         )
     return entries
+
+
+# -- kinship (PRD feature 2: explicit statements only, never inferred) ------
+
+_KINSHIP_WORDS = (
+    "cousin", "half-brother", "step-brother", "brother", "sister", "father",
+    "mother", "son", "daughter", "uncle", "aunt", "nephew", "niece", "twin",
+    "grandfather", "grandmother", "grandson", "granddaughter",
+)
+_KINSHIP_ALT = "|".join(_KINSHIP_WORDS)
+# "[[huNter-]]" Kovač's cousin" — a wiki link shortly before "<word>'s kin".
+_KIN_POSSESSIVE = re.compile(
+    rf"\[\[([^\]|]+)(?:\|[^\]]+)?\]\][^.\n]{{0,60}}'?s\s+({_KINSHIP_ALT})\b",
+    re.IGNORECASE,
+)
+# "cousin of [[huNter-]]"
+_KIN_OF = re.compile(
+    rf"\b({_KINSHIP_ALT})\s+of\s+\[\[([^\]|]+)", re.IGNORECASE,
+)
+# "huNter-'s cousin" without a wiki link; tight token to limit false hits.
+_KIN_PLAIN = re.compile(
+    rf"\b([A-Za-z0-9'\-\.]{{1,30}})'s\s+({_KINSHIP_ALT})\b", re.IGNORECASE,
+)
+
+_NAME_NOISE = re.compile(r"\(.*?\)|[^a-z0-9'\- ]")
+
+
+def name_key(value: str) -> str:
+    """Normalize a nickname/real name for comparison."""
+    return _NAME_NOISE.sub("", value.lower()).strip()
+
+
+def _person_matches(person_raw: str, other_names: set[str]) -> bool:
+    person = name_key(person_raw.split("|")[0])
+    return bool(person) and person in other_names
+
+
+def _sentence_around(text: str, start: int, end: int) -> str:
+    left = text.rfind(".", 0, start)
+    right = text.find(".", end)
+    sentence = text[left + 1 : right if right > 0 else len(text)]
+    return sentence.strip()[:300]
+
+
+def find_kinship(
+    wikitext: str, other_names: set[str], source_page: str,
+) -> KinshipRecord | None:
+    """Explicitly stated family relation mentioning one of ``other_names``.
+
+    Scans possessive ("X's cousin") and "kin of X" patterns around wiki
+    links. Anything not literally written on the page returns None.
+    """
+    prose = _HTML_COMMENT.sub("", wikitext)
+    patterns = ((_KIN_POSSESSIVE, 1, 2), (_KIN_OF, 2, 1), (_KIN_PLAIN, 1, 2))
+    for pattern, person_group, kin_group in patterns:
+        for match in pattern.finditer(prose):
+            person_raw = clean(match.group(person_group))
+            if not _person_matches(person_raw, other_names):
+                continue
+            return KinshipRecord(
+                relation=match.group(kin_group).lower(),
+                person=person_raw,
+                evidence=_sentence_around(prose, match.start(), match.end()),
+                source_page=source_page,
+            )
+    return None
+
+
+def other_names_for(player: Player, page_title: str) -> set[str]:
+    """Every name spelling by which a player might be mentioned."""
+    names = {name_key(player.nickname), name_key(page_title)}
+    if player.real_name:
+        names.add(name_key(player.real_name))
+        names.update(name_key(part) for part in player.real_name.split())
+    names.discard("")
+    return names

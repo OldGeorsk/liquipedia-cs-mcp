@@ -85,6 +85,19 @@ class Tenure(BaseModel):
     end: DateValue | None = None
 
 
+class CareerStint(BaseModel):
+    """One entry of a player's full recorded team history (PRD feature 1)."""
+
+    team: TeamRef                      # name exactly as written on the page
+    canonical_team: str | None = None  # rename-resolved name, when known
+    game: str = "unknown"              # CS / CS:GO / CS2 / unknown
+    start: DateValue | None = None
+    end: DateValue | None = None       # None + ongoing=True means "Present"
+    ongoing: bool = False
+    identity: str | None = None        # annotated role: inactive, stand-in, ...; None = not stated
+    note: str | None = None
+
+
 class RelationConfidence(StrEnum):
     CONFIRMED = "confirmed"
     UNCONFIRMED = "unconfirmed"  # overlap could not be pinned down from sources
@@ -125,13 +138,60 @@ class NetworkResult(BaseModel):
     previous_teams: list[PreviousTeamGroup] = Field(default_factory=list)
 
 
+class CareerResult(BaseModel):
+    """The payload of get_player_career (PRD feature 1)."""
+
+    player: Player
+    stints: list[CareerStint] = Field(default_factory=list)
+
+
+class OverlapWindow(BaseModel):
+    """Verified overlap between two stints (PRD feature 2)."""
+
+    verdict: str                     # confirmed / unconfirmed / none
+    start: DateValue | None = None
+    end: DateValue | None = None
+    reason: str | None = None        # why it could not be confirmed
+
+
+class SharedTeamRecord(BaseModel):
+    """One team where both players have recorded stints."""
+
+    team: TeamRef
+    canonical_team: str | None = None
+    a_stint: CareerStint
+    b_stint: CareerStint
+    overlap: OverlapWindow
+    playing_together: bool | None = None  # None = identities not recorded
+    games: list[str] = Field(default_factory=list)
+
+
+class KinshipRecord(BaseModel):
+    """An explicitly stated family relation; never inferred."""
+
+    relation: str      # cousin / brother / ...
+    person: str        # the mentioned person, as written
+    evidence: str      # the exact sentence from the page
+    source_page: str
+
+
+class RelationshipResult(BaseModel):
+    """The payload of get_player_relationship (PRD feature 2)."""
+
+    player_a: Player
+    player_b: Player
+    shared_teams: list[SharedTeamRecord] = Field(default_factory=list)
+    kinship: KinshipRecord | None = None
+    summary: str | None = None
+
+
 class Envelope(BaseModel):
     """Unified response wrapper returned by every MCP tool."""
 
     status: JobStatus | str
     job_id: str | None = None
     player_id: str | None = None
-    result: NetworkResult | None = None
+    result: NetworkResult | CareerResult | RelationshipResult | None = None
     progress: str | None = None
     fetched_at: datetime | None = None
     served_at: datetime = Field(default_factory=utcnow)

@@ -33,6 +33,8 @@ Register `http://127.0.0.1:8000/mcp` (Streamable HTTP) in your MCP client:
 | `search_players` | `query`, `limit` (1–5) | player candidates with `player_id` |
 | `get_player_network` | `player_id` | cached result, or a `job_id` to poll |
 | `get_lookup_result` | `job_id` | status/progress + result with `sources`, timestamps, CC BY-SA 3.0 license, `warnings`; unknowns are `null` with a reason |
+| `get_player_career` | `player_id` | full recorded team history: every stint with game tag (CS / CS:GO / CS2), dates at recorded precision, stint identity, rename-resolved teams |
+| `get_player_relationship` | `player_a`, `player_b` | shared teams with verified overlap windows (`confirmed` / `unconfirmed` / `none`), playing identities, and explicitly stated kinship (never inferred) |
 
 ## Configuration (env vars, `LIQUIPEDIA_` prefix)
 

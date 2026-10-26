@@ -13,11 +13,14 @@ from datetime import datetime, timezone
 from app.config import Settings
 from app.liquipedia import LiquipediaClient, ProviderError, RateLimited, page_url
 from app.models import (
-    Envelope, JobStatus, NetworkResult, Player, PreviousTeamGroup,
-    RelationConfidence, Source, TeamStatus, Teammate,
+    CareerResult, CareerStint, Envelope, JobStatus, KinshipRecord,
+    NetworkResult, OverlapWindow, Player, PreviousTeamGroup,
+    RelationConfidence, RelationshipResult, SharedTeamRecord, Source,
+    TeamStatus, Teammate,
 )
 from app.parsing import (
-    SquadEntry, first_active_squad, overlap_verdict, parse_player, parse_squads,
+    SquadEntry, date_bounds, find_kinship, first_active_squad, name_key,
+    other_names_for, overlap_verdict, parse_career, parse_player, parse_squads,
     parse_team_history, recent_previous_teams,
 )
 from app.store import Store
@@ -29,6 +32,13 @@ class _BudgetExhausted(Exception):
 
 class _Paused(Exception):
     """Raised when upstream throttling refuses to let the job continue."""
+
+
+_STAFF_HINTS = ("coach", "manager", "analyst", "owner", "ceo")
+
+
+def _staff_identity(text: str) -> bool:
+    return any(hint in text for hint in _STAFF_HINTS)
 
 
 class PlayerNetworkService:
@@ -102,6 +112,107 @@ class PlayerNetworkService:
     async def result(self, job_id: str) -> Envelope | None:
         job = self._store.get_job(job_id)
         return self._envelope(job) if job else None
+
+    async def career(self, player_id: str) -> Envelope:
+        """Full recorded team history of one player (PRD feature 1).
+
+        Costs a single page fetch (cache-served when fresh); no job queue.
+        """
+        player_id = player_id.strip()
+        try:
+            page = await self._fetch(player_id, None)
+        except (ProviderError, RateLimited) as exc:
+            return Envelope(status=JobStatus.FAILED, player_id=player_id,
+                            error=f"lookup failed: {exc}")
+        player = parse_player(
+            page.wikitext, title=page.title, page_id=page.page_id,
+            settings=self._settings, revision_id=page.revision_id,
+            fetched_at=page.fetched_at,
+        )
+        stints = parse_career(page.wikitext, self._settings)
+        warnings = [] if stints else ["no team history recorded on the page"]
+        for stint in stints:
+            self._stamp_canonical(stint)
+        return Envelope(
+            status=JobStatus.COMPLETE, player_id=page.title,
+            result=CareerResult(player=player, stints=stints),
+            fetched_at=page.fetched_at, sources=self._sources_of(player),
+            warnings=warnings,
+        )
+
+    async def relationship(self, player_a: str, player_b: str) -> Envelope:
+        """Shared-tenure and kinship judgment between two players (PRD feature 2).
+
+        Costs one batched request for both pages when cold.
+        """
+        a_id, b_id = player_a.strip(), player_b.strip()
+        if name_key(a_id) == name_key(b_id):
+            return Envelope(status=JobStatus.FAILED, error="player_a and player_b are the same")
+        try:
+            batch = await self._client.get_wikitext_many([a_id, b_id])
+        except RateLimited as exc:
+            return Envelope(status=JobStatus.FAILED, error=f"rate limited: {exc}")
+        missing = [t for t in (a_id, b_id) if t in batch.missing]
+        if missing:
+            return Envelope(status=JobStatus.FAILED, error=f"player page not found: {', '.join(missing)}")
+        a_page, b_page = batch.pages[a_id], batch.pages[b_id]
+        a_player = parse_player(a_page.wikitext, title=a_page.title, page_id=a_page.page_id,
+                                settings=self._settings, revision_id=a_page.revision_id,
+                                fetched_at=a_page.fetched_at)
+        b_player = parse_player(b_page.wikitext, title=b_page.title, page_id=b_page.page_id,
+                                settings=self._settings, revision_id=b_page.revision_id,
+                                fetched_at=b_page.fetched_at)
+        a_stints = parse_career(a_page.wikitext, self._settings)
+        b_stints = parse_career(b_page.wikitext, self._settings)
+
+        records: list[SharedTeamRecord] = []
+        for a_stint in a_stints:
+            self._stamp_canonical(a_stint)
+            a_key = name_key(self._store.canonical_title(a_stint.team.name))
+            for b_stint in b_stints:
+                self._stamp_canonical(b_stint)
+                b_key = name_key(self._store.canonical_title(b_stint.team.name))
+                if a_key != b_key or not a_key:
+                    continue
+                records.append(SharedTeamRecord(
+                    team=a_stint.team,
+                    canonical_team=(a_stint.canonical_team or b_stint.canonical_team),
+                    a_stint=a_stint, b_stint=b_stint,
+                    overlap=self._overlap_window(a_stint, b_stint),
+                    playing_together=self._playing_together(a_player, b_player, a_stint, b_stint),
+                    games=sorted({g for g in (a_stint.game, b_stint.game) if g != "unknown"}),
+                ))
+        records.sort(key=lambda r: (name_key(r.team.name),
+                                    r.a_stint.start.raw if r.a_stint.start else ""))
+
+        kinship = find_kinship(
+            a_page.wikitext, other_names_for(b_player, b_page.title), a_page.title,
+        ) or find_kinship(
+            b_page.wikitext, other_names_for(a_player, a_page.title), b_page.title,
+        )
+        confirmed = sum(1 for r in records if r.overlap.verdict == "confirmed")
+        warnings = []
+        if not a_stints:
+            warnings.append(f"no team history recorded for {a_player.nickname}")
+        if not b_stints:
+            warnings.append(f"no team history recorded for {b_player.nickname}")
+        if not records and not kinship:
+            warnings.append("no shared team records found; this is not proof of no relation")
+        summary = (
+            f"{confirmed} confirmed shared stint(s) at "
+            f"{len({name_key(r.team.name) for r in records if r.overlap.verdict == 'confirmed'})} team(s)"
+            if confirmed else ("no overlapping shared stints found" if records else None)
+        )
+        fetched = max(x.fetched_at for x in (a_page, b_page))
+        return Envelope(
+            status=JobStatus.COMPLETE,
+            result=RelationshipResult(player_a=a_player, player_b=b_player,
+                                      shared_teams=records, kinship=kinship,
+                                      summary=summary),
+            fetched_at=fetched,
+            sources=self._sources_of(a_player) + self._sources_of(b_player),
+            warnings=warnings,
+        )
 
     # -- job execution --------------------------------------------------------
 
@@ -307,6 +418,60 @@ class PlayerNetworkService:
 
     # -- helpers ----------------------------------------------------------------
 
+    @staticmethod
+    def _overlap_window(a_stint: CareerStint, b_stint: CareerStint) -> OverlapWindow:
+        """Verdict plus the best-estimate overlap interval of two stints."""
+        verdict = overlap_verdict(
+            (a_stint.start, a_stint.end), (b_stint.start, b_stint.end)
+        )
+        if verdict == "none":
+            return OverlapWindow(verdict="none", reason="stints do not overlap in time")
+        # Overlap window: later start to earlier end (open end = ongoing).
+        a_lo = date_bounds(a_stint.start, is_start=True)[0] if a_stint.start else 0
+        b_lo = date_bounds(b_stint.start, is_start=True)[0] if b_stint.start else 0
+        later_start = a_stint.start if a_lo >= b_lo else b_stint.start
+        if a_stint.end is None:
+            earlier_end = b_stint.end
+        elif b_stint.end is None:
+            earlier_end = a_stint.end
+        elif date_bounds(a_stint.end, is_start=False)[0] <= date_bounds(b_stint.end, is_start=False)[0]:
+            earlier_end = a_stint.end
+        else:
+            earlier_end = b_stint.end
+        return OverlapWindow(
+            verdict=verdict, start=later_start, end=earlier_end,
+            reason=None if verdict == "confirmed"
+            else "date precision on the pages is insufficient to confirm the overlap",
+        )
+
+    @staticmethod
+    def _playing_together(a: Player, b: Player, a_stint: CareerStint, b_stint: CareerStint) -> bool:
+        """False when either side was staff / benched / stand-in at the time.
+
+        Player pages themselves assert 'player', so True is the default; stint
+        annotations and page-level staff roles can only overturn it.
+        """
+        for stint in (a_stint, b_stint):
+            identity = (stint.identity or "").lower()
+            if identity in {"inactive", "trial", "benched", "substitute", "sub",
+                            "stand-in", "standin"} or _staff_identity(identity):
+                return False
+        for player in (a, b):
+            if _staff_identity(" ".join(player.roles).lower()):
+                return False
+        return True
+
+    @staticmethod
+    def _sources_of(player: Player) -> list[Source]:
+        return list(player.sources)
+
+    def _stamp_canonical(self, stint: CareerStint) -> None:
+        """Fill canonical_team from recorded redirect aliases, once."""
+        if stint.canonical_team is None:
+            canonical = self._store.canonical_title(stint.team.name)
+            if name_key(canonical) != name_key(stint.team.name):
+                stint.canonical_team = canonical
+
     async def _fetch_batch(self, titles: list[str], budget: "_Budget") -> dict:
         """Load many pages through the batched provider, honoring the budget.
 
@@ -330,9 +495,10 @@ class PlayerNetworkService:
         budget.used += len(batch.fresh_pages)
         return batch.pages
 
-    async def _fetch(self, title: str, budget: "_Budget", required: bool = True):
+    async def _fetch(self, title: str, budget: "_Budget | None", required: bool = True):
         """Fetch a page through cache+scheduler, honoring the page budget.
 
+        ``budget=None`` skips budget accounting (single-page tools).
         Returns None when the page does not exist and ``required`` is False.
         Pages known-missing from an earlier run are skipped for free, so a
         resumed job converges instead of re-spending budget on 404s.
@@ -341,18 +507,20 @@ class PlayerNetworkService:
             if required:
                 raise ProviderError(f"page not found: {title}", code="page_missing")
             return None
-        if budget.exhausted and not self._fresh_cached(title):
+        if budget is not None and budget.exhausted and not self._fresh_cached(title):
             raise _BudgetExhausted(title)
         attempts = 0
         while True:
             try:
                 page = await self._client.get_wikitext(title)
-                if not page.from_cache:
+                if not page.from_cache and budget is not None:
                     budget.spend()  # only fresh upstream pages cost budget
                 return page
             except RateLimited as exc:
                 attempts += 1
                 if attempts > 1:
+                    if budget is None:
+                        raise
                     raise _Paused(
                         f"rate limited twice; paused after Retry-After {exc.retry_after}s"
                     ) from exc

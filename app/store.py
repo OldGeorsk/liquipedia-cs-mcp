@@ -82,6 +82,17 @@ class Store:
             ).fetchone()
         return row[0] if row else None
 
+    def canonical_title(self, title: str) -> str:
+        """Follow saved redirect aliases to the canonical title."""
+        seen: set[str] = set()
+        while title not in seen:
+            seen.add(title)
+            nxt = self.get_redirect(title)
+            if not nxt or nxt == title:
+                return title
+            title = nxt
+        return title
+
     def save_redirect(self, src: str, dst: str) -> None:
         with self._lock:
             self._conn.execute(

@@ -236,14 +236,7 @@ class LiquipediaClient:
 
     def _canonical(self, title: str) -> str:
         """Follow saved redirect aliases to the canonical title."""
-        seen: set[str] = set()
-        while title not in seen:
-            seen.add(title)
-            nxt = self._store.get_redirect(title)
-            if not nxt or nxt == title:
-                return title
-            title = nxt
-        return title
+        return self._store.canonical_title(title)
 
     def _is_fresh(self, cached: dict) -> bool:
         fetched = datetime.fromisoformat(cached["fetched_at"]).timestamp()

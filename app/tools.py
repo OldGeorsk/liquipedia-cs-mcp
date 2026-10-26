@@ -1,4 +1,4 @@
-"""The three MCP tools defined by PRD section 5."""
+"""MCP tools: PRD section 5 lookups plus the career/relationship tools."""
 
 import json
 
@@ -11,9 +11,11 @@ from app.network import PlayerNetworkService
 
 _INSTRUCTIONS = (
     "Liquipedia Counter-Strike player lookup. "
-    "First call search_players to resolve a nickname to a player_id (page title), "
-    "then get_player_network to start or resume a lookup, "
-    "then get_lookup_result with the returned job_id until status is complete. "
+    "First call search_players to resolve a nickname to a player_id (page title). "
+    "get_player_network then get_lookup_result run the async teammate lookup; "
+    "get_player_career returns a player's full recorded team history; "
+    "get_player_relationship compares two players' histories for shared stints "
+    "and explicitly stated kinship. "
     f"All text data is {LICENSE_NAME} via Liquipedia."
 )
 
@@ -76,6 +78,35 @@ def build_server(
         envelope = await service.result(job_id.strip())
         if envelope is None:
             return _json({"error": f"unknown job_id: {job_id}"})
+        return envelope.model_dump_json(indent=2)
+
+    @server.tool()
+    async def get_player_career(player_id: str) -> str:
+        """Return a player's complete recorded team history.
+
+        Covers every stint on the page: early teams, academy stints and
+        repeated spells, each with game tag (CS / CS:GO / CS2), dates at
+        their recorded precision, stint identity (inactive, stand-in, ...)
+        and source. Cached results return immediately.
+        """
+        if not player_id or not player_id.strip():
+            return _json({"error": "player_id must be a non-empty string"})
+        envelope = await service.career(player_id)
+        return envelope.model_dump_json(indent=2)
+
+    @server.tool()
+    async def get_player_relationship(player_a: str, player_b: str) -> str:
+        """Judge the relationship between two players from their pages.
+
+        Returns every team both have recorded stints at, with the verified
+        overlap window ('confirmed' / 'unconfirmed' / 'none'), the identity
+        each had at the time, and any family relation explicitly stated on
+        either page (never inferred). Sequential-only stints never come back
+        as confirmed teammates.
+        """
+        if not player_a.strip() or not player_b.strip():
+            return _json({"error": "player_a and player_b must be non-empty strings"})
+        envelope = await service.relationship(player_a, player_b)
         return envelope.model_dump_json(indent=2)
 
     return server

@@ -49,6 +49,16 @@ class PageContent:
     from_cache: bool
 
 
+@dataclass
+class BatchResult:
+    """Outcome of a batched page fetch."""
+
+    pages: dict[str, PageContent]  # by requested title
+    missing: set[str]              # requested titles with no page upstream
+    deferred: set[str]             # skipped: would exceed max_fresh
+    fresh_pages: set[str]          # canonical titles actually loaded now
+
+
 _TAG = re.compile(r"<[^>]+>")
 
 
@@ -83,16 +93,9 @@ class LiquipediaClient:
 
     async def get_wikitext(self, title: str) -> PageContent:
         """Return cached wikitext when fresh; otherwise fetch one revision."""
-        # Resolve known redirects first so alias titles hit the page cache.
-        canonical = self._store.get_redirect(title) or title
-        cached = self._store.get_page(canonical)
-        if cached and self._is_fresh(cached):
-            return PageContent(
-                title=cached["title"], page_id=cached["page_id"],
-                wikitext=cached["wikitext"], revision_id=cached["revision_id"],
-                fetched_at=datetime.fromisoformat(cached["fetched_at"]),
-                from_cache=True,
-            )
+        cached = self._cached_page(title)
+        if cached:
+            return cached
         # Coalesce: concurrent callers for the same title share one request.
         existing = self._inflight.get(title)
         if existing is not None:
@@ -103,6 +106,37 @@ class LiquipediaClient:
             return await asyncio.shield(task)
         finally:
             self._inflight.pop(title, None)
+
+    async def get_wikitext_many(
+        self, titles: list[str], max_fresh: int | None = None,
+    ) -> BatchResult:
+        """Fetch several pages in as few requests as possible.
+
+        MediaWiki accepts ``titles=A|B|C``; each chunk of ``batch_page_limit``
+        uncached titles becomes exactly one upstream request, so N pages cost
+        N/batch_page_limit requests instead of N. Cached titles are served
+        free; ``max_fresh`` (the caller's remaining page budget) defers the
+        titles that would overspend it instead of fetching partially.
+        """
+        pages: dict[str, PageContent] = {}
+        wanted: list[str] = []
+        for title in dict.fromkeys(titles):  # dedupe, keep order
+            cached = self._cached_page(title)
+            if cached is not None:
+                pages[title] = cached
+            else:
+                wanted.append(title)
+        fresh_budget = len(wanted) if max_fresh is None else max(0, max_fresh)
+        deferred = set(wanted[fresh_budget:])
+        result = BatchResult(pages=pages, missing=set(), deferred=deferred,
+                             fresh_pages=set())
+        for start in range(0, fresh_budget, self._settings.batch_page_limit):
+            chunk = wanted[start:start + self._settings.batch_page_limit]
+            chunk_pages, chunk_missing, chunk_fresh = await self._fetch_chunk(chunk)
+            result.pages.update(chunk_pages)
+            result.missing.update(chunk_missing)
+            result.fresh_pages.update(chunk_fresh)
+        return result
 
     async def _fetch_wikitext(self, title: str) -> PageContent:
         params = {
@@ -135,6 +169,81 @@ class LiquipediaClient:
                 from_cache=False,
             )
         raise ProviderError(f"page not found: {title}", code="page_missing")
+
+    async def _fetch_chunk(self, titles: list[str]) -> tuple[dict[str, PageContent], set[str], set[str]]:
+        """One upstream request for several titles.
+
+        Returns (pages by requested title, missing titles, fresh canonical titles).
+        """
+        params = {
+            "action": "query", "prop": "revisions", "rvprop": "ids|content",
+            "rvslots": "main", "titles": "|".join(titles), "redirects": "1",
+            "format": "json",
+        }
+        data = await self._request(params)
+        query = data.get("query", {})
+        # Map every hop of the redirect/normalization chains for this response.
+        hop: dict[str, str] = {}
+        for redirect in query.get("redirects", []) + query.get("normalized", []):
+            src, dst = redirect.get("from", ""), redirect.get("to", "")
+            if src and dst:
+                hop[src] = dst
+                self._store.save_redirect(src, dst)
+        fetched_at = datetime.now(timezone.utc)
+        by_canonical: dict[str, PageContent] = {}
+        for page in query.get("pages", {}).values():
+            revisions = page.get("revisions") or []
+            if "missing" in page or not revisions:
+                continue
+            slot = revisions[0].get("slots", {}).get("main", {})
+            content = slot.get("*", "")
+            canonical = page.get("title", "")
+            self._store.save_page(
+                canonical, page.get("pageid"), content,
+                revisions[0].get("revid"), fetched_at,
+            )
+            by_canonical[canonical] = PageContent(
+                title=canonical, page_id=page.get("pageid"), wikitext=content,
+                revision_id=revisions[0].get("revid"), fetched_at=fetched_at,
+                from_cache=False,
+            )
+        pages: dict[str, PageContent] = {}
+        missing: set[str] = set()
+        for title in titles:
+            target = title
+            seen: set[str] = set()
+            while target in hop and target not in seen:
+                seen.add(target)
+                target = hop[target]
+            if target in by_canonical:
+                pages[title] = by_canonical[target]
+            else:
+                missing.add(title)
+        fresh = {page.title for page in by_canonical.values()}
+        return pages, missing, fresh
+
+    def _cached_page(self, title: str) -> PageContent | None:
+        """Fresh cached page for a title, following redirect aliases."""
+        row = self._store.get_page(self._canonical(title))
+        if not row or not self._is_fresh(row):
+            return None
+        return PageContent(
+            title=row["title"], page_id=row["page_id"],
+            wikitext=row["wikitext"], revision_id=row["revision_id"],
+            fetched_at=datetime.fromisoformat(row["fetched_at"]),
+            from_cache=True,
+        )
+
+    def _canonical(self, title: str) -> str:
+        """Follow saved redirect aliases to the canonical title."""
+        seen: set[str] = set()
+        while title not in seen:
+            seen.add(title)
+            nxt = self._store.get_redirect(title)
+            if not nxt or nxt == title:
+                return title
+            title = nxt
+        return title
 
     def _is_fresh(self, cached: dict) -> bool:
         fetched = datetime.fromisoformat(cached["fetched_at"]).timestamp()

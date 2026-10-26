@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     request_timeout: float = 30.0
     cache_ttl_seconds: float = 86400.0  # one day
     page_budget_per_job: int = 30
+    # Titles per batched query request; keeps responses modest in size.
+    batch_page_limit: int = 10
 
     host: str = "127.0.0.1"
     port: int = 8000

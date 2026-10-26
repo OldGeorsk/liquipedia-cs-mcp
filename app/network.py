@@ -172,7 +172,6 @@ class PlayerNetworkService:
         if "current_teammates" in stages:
             return [Teammate.model_validate(t) for t in stages["current_teammates"]]
 
-        teammates: list[Teammate] = []
         team = player.current_team
         rows: list[SquadEntry] = []
         if team and team.name:
@@ -184,9 +183,18 @@ class PlayerNetworkService:
                 team.page_id = page.page_id
                 # Only the first "active" squad: that is the current-game tab.
                 rows = first_active_squad(parse_squads(page.wikitext))
-        teammates = await self._profiles_for_rows(
-            rows, team, player, budget, sources, warnings
-        )
+        rows = [
+            r for r in rows
+            if not r.staff and r.nickname and r.nickname != player.nickname
+        ]
+        pages = await self._fetch_batch([r.nickname for r in rows], budget)
+        for page in pages.values():
+            self._remember_source(sources, page)
+        teammates = [
+            self._teammate_from_row(row, team, pages.get(row.nickname),
+                                    relation=RelationConfidence.CONFIRMED)
+            for row in rows
+        ]
         stages["current_teammates"] = [t.model_dump(mode="json") for t in teammates]
         return teammates
 
@@ -209,19 +217,27 @@ class PlayerNetworkService:
 
         current_name = player.current_team.name if player.current_team else None
         picks = recent_previous_teams(history, current_name, limit=3)
+        team_pages = await self._fetch_batch(
+            [tenure.team.name for tenure in picks], budget
+        )
+        for page in team_pages.values():
+            self._remember_source(sources, page)
+
+        # Parse every team first, then batch-load all member pages at once.
+        groups: list[PreviousTeamGroup] = []
+        member_rows: dict[str, list[tuple[SquadEntry, RelationConfidence, TeamRef]]] = {}
         for tenure in picks:
-            page = await self._fetch(tenure.team.name, budget, required=False)
+            page = team_pages.get(tenure.team.name)
             if page is None:
                 warnings.append(f"previous team page not found: {tenure.team.name}")
-                done.append(PreviousTeamGroup(
+                groups.append(PreviousTeamGroup(
                     tenure=tenure, note="team page missing; roster history unavailable"
                 ))
                 continue
-            self._remember_source(sources, page)
             tenure.team.page_id = page.page_id
             target_window = (tenure.start, tenure.end)
-            confirmed: list[Teammate] = []
-            unconfirmed: list[Teammate] = []
+            confirmed: list[tuple[SquadEntry, RelationConfidence, TeamRef]] = []
+            unconfirmed: list[tuple[SquadEntry, RelationConfidence, TeamRef]] = []
             seen: set[str] = set()
             for row in parse_squads(page.wikitext):
                 if row.staff or not row.nickname or row.nickname == player.nickname:
@@ -232,67 +248,87 @@ class PlayerNetworkService:
                 if verdict == "none":
                     continue
                 seen.add(row.nickname)
-                group = confirmed if verdict == "confirmed" else unconfirmed
-                group.append(await self._teammate_from_row(
-                    row, tenure.team, player, budget, sources, warnings,
-                    relation=RelationConfidence.CONFIRMED if verdict == "confirmed"
+                bucket = confirmed if verdict == "confirmed" else unconfirmed
+                bucket.append((
+                    row,
+                    RelationConfidence.CONFIRMED if verdict == "confirmed"
                     else RelationConfidence.UNCONFIRMED,
+                    tenure.team,
                 ))
-            done.append(PreviousTeamGroup(
-                tenure=tenure, teammates=confirmed, unconfirmed=unconfirmed,
-            ))
+            member_rows[tenure.team.name] = confirmed + unconfirmed
+            groups.append(PreviousTeamGroup(tenure=tenure))
+
+        all_rows = [entry for rows in member_rows.values() for entry in rows]
+        member_pages = await self._fetch_batch(
+            [entry[0].nickname for entry in all_rows], budget
+        )
+        for page in member_pages.values():
+            self._remember_source(sources, page)
+        for group in groups:
+            for row, relation, team in member_rows.get(group.tenure.team.name, []):
+                teammate = self._teammate_from_row(
+                    row, team, member_pages.get(row.nickname), relation=relation
+                )
+                if relation == RelationConfidence.CONFIRMED:
+                    group.teammates.append(teammate)
+                else:
+                    group.unconfirmed.append(teammate)
+        done.extend(groups)
         stages["previous_teams"] = [g.model_dump(mode="json") for g in done]
         stages["history_done"] = True
         return done
 
-    async def _profiles_for_rows(
-        self, rows, team, player, budget, sources, warnings,
-    ) -> list[Teammate]:
-        teammates: list[Teammate] = []
-        for row in rows:
-            if row.staff or not row.nickname or row.nickname == player.nickname:
-                continue
-            teammates.append(await self._teammate_from_row(
-                row, team, player, budget, sources, warnings,
-                relation=RelationConfidence.CONFIRMED,
-            ))
-        return teammates
-
-    async def _teammate_from_row(
-        self, row, team, player, budget, sources, warnings, relation,
+    def _teammate_from_row(
+        self, row: SquadEntry, team, page, relation: RelationConfidence,
     ) -> Teammate:
-        """Prefer the teammate's own page; fall back to the roster row."""
-        note = "substitute" if row.substitute else None
-        profile: Player | None = None
-        try:
-            page = await self._fetch(row.nickname, budget, required=False)
-        except _BudgetExhausted:
-            raise
+        """Build a teammate from a roster row; ``page`` is the profile page
+        when one was fetched, otherwise the row itself is all we know."""
         if page is not None:
-            self._remember_source(sources, page)
             profile = parse_player(
                 page.wikitext, title=page.title, page_id=page.page_id,
                 settings=self._settings, revision_id=page.revision_id,
                 fetched_at=page.fetched_at,
             )
-        if profile is None:
-            fallback_missing = ["profile page unavailable; data from roster row only"]
+            note = "substitute" if row.substitute else None
+        else:
             profile = Player(
                 nickname=row.nickname, real_name=row.real_name,
                 nationality=row.nationality, roles=list(row.roles) or [],
-                team_status=TeamStatus.UNKNOWN, missing=fallback_missing,
+                team_status=TeamStatus.UNKNOWN,
+                missing=["profile page unavailable; data from roster row only"],
             )
-            if note is None:
-                note = "profile not fetched (budget or missing page)"
-        if row.roles:
-            for role in row.roles:
-                if role not in profile.roles:
-                    profile.roles.append(role)
-        if note == "substitute":
+            note = "substitute" if row.substitute else "profile not fetched (missing page)"
+        for role in row.roles:
+            if role not in profile.roles:
+                profile.roles.append(role)
+        if row.substitute:
             profile.missing.append("marked as substitute in the roster row")
         return Teammate(player=profile, team=team, relation=relation, note=note)
 
     # -- helpers ----------------------------------------------------------------
+
+    async def _fetch_batch(self, titles: list[str], budget: "_Budget") -> dict:
+        """Load many pages through the batched provider, honoring the budget.
+
+        Budget is spent on fresh canonical pages only. When the remaining
+        budget cannot cover the batch, nothing is fetched and the phase is
+        aborted (resumed later); stages stay consistent that way.
+        """
+        wanted = [t for t in dict.fromkeys(titles) if t not in self._missing_pages]
+        if not wanted:
+            return {}
+        batch = await self._client.get_wikitext_many(
+            wanted, max_fresh=budget.limit - budget.used
+        )
+        # Record genuinely absent pages even when deferring the rest, so a
+        # resumed run never re-queries them.
+        self._missing_pages.update(batch.missing)
+        if batch.deferred:
+            raise _BudgetExhausted(
+                f"page budget too small for {len(batch.deferred)} more pages"
+            )
+        budget.used += len(batch.fresh_pages)
+        return batch.pages
 
     async def _fetch(self, title: str, budget: "_Budget", required: bool = True):
         """Fetch a page through cache+scheduler, honoring the page budget.

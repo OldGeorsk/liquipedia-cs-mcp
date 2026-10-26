@@ -48,3 +48,5 @@ Register `http://127.0.0.1:8000/mcp` (Streamable HTTP) in your MCP client:
 - A single serialized scheduler paces every upstream request with randomized
 - 2.3–3.0 s spacing (above Liquipedia's 2 s floor) and persists the clock in
 - SQLite; 429s honor `Retry-After`, and page budgets keep every job resumable.
+- Page fetches are batched (`titles=A|B|C`, ≤10 titles per request), so a full
+- network lookup costs roughly 7 upstream requests instead of ~30.

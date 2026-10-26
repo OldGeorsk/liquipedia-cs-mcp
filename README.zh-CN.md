@@ -1,9 +1,10 @@
 # liquipedia-cs-mcp
 [English](README.md) | 简体中文
 
-- 本地 MCP 服务器,用于在 [Liquipedia](https://liquipedia.net/counterstrike) 上查询反恐精英(Counter-Strike)选手:
-- 个人资料、现队友,以及最近三支前队伍各自的队友;
-- 完整职业生涯履历(逐段带游戏项目标签),以及两名选手间的关系判定(经核验的共同效力、明文记载的亲属关系)。
+- 本地 MCP 服务器,用于在 [Liquipedia](https://liquipedia.net/counterstrike) 上查询反恐精英(Counter-Strike)战队与选手:
+- 现役战队阵容(选手与教练/工作人员分开)、个人资料、现队友,以及最近三支前队伍各自的队友;
+- 完整职业生涯履历(逐段带游戏项目标签),以及两名选手间的关系判定(经核验的共同效力、明文记载的亲属关系);
+- 资源类型不匹配时(把队伍页传给选手工具,或反过来)返回 `isError`、机器可读错误码和正确的替代工具,不再返回"成功但为空"的结果。
 
 ## 安装
 
@@ -32,10 +33,11 @@ python -m venv .venv
 | 工具 | 输入 | 输出 |
 | --- | --- | --- |
 | `search_players` | `query`、`limit`(1–5) | 候选选手列表,含 `player_id` |
-| `get_player_network` | `player_id` | 缓存结果,或用于轮询的 `job_id` |
-| `get_lookup_result` | `job_id` | 状态/进度 + 结果(含 `sources`、时间戳、CC BY-SA 3.0 许可信息、`warnings`;未知字段返回 `null` 并附原因) |
+| `get_team_roster` | `team_id`、`include_staff` | 现役选手(昵称/真名/国籍/年龄/角色/加入日期,`confirmed`/`substitute`)以及单独列出的教练与工作人员 |
+| `get_player_network` | `player_id`、`wait_ms`(0–60000) | 缓存结果、等待后的终态结果,或用于轮询的 `job_id` |
+| `get_lookup_result` | `job_id` | 状态/进度 + 结果(含 `sources`、时间戳、CC BY-SA 3.0 许可信息、`warnings`;失败任务带 `error.code`,如 `job_stalled`) |
 | `get_player_career` | `player_id` | 完整战队履历:每段效力的游戏标签(CS / CS:GO / CS2)、原始精度的日期、身份标注、改名归一后的战队名 |
-| `get_player_relationship` | `player_a`、`player_b` | 共同效力战队及核验过的重叠区间(`confirmed` / `unconfirmed` / `none`)、双方当时身份、明文记载的亲属关系(绝不推断) |
+| `get_player_relationship` | `player_a`、`player_b`、`include_non_overlapping` | 有重叠的共同效力区间(`confirmed` / `unconfirmed`)、双方当时身份、明文记载的亲属关系;无重叠的碎片默认隐藏,仅计入 `omitted` |
 
 ## 配置(环境变量,`LIQUIPEDIA_` 前缀)
 
@@ -44,6 +46,7 @@ python -m venv .venv
 | `LIQUIPEDIA_CONTACT` | *(在 `.env` 中设置)* | User-Agent 中必需的联系方式 |
 | `LIQUIPEDIA_CACHE_TTL_SECONDS` | `86400` | 页面缓存有效期(秒) |
 | `LIQUIPEDIA_PAGE_BUDGET_PER_JOB` | `30` | 每个查询任务的新页面抓取上限 |
+| `LIQUIPEDIA_JOB_STALL_SECONDS` | `60` | 无心跳超过该秒数后,孤儿任务转为 `failed` / `job_stalled` |
 | `LIQUIPEDIA_API_URL` | counterstrike wiki API | 上游接口地址 |
 
 ## 合规设计

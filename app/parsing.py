@@ -22,9 +22,10 @@ from app.models import (
 
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 _WIKI_MARKUP = re.compile(r"'{2,3}|<[^>]+>")
+# Team pages wrap dates in {{abbr|2019-09-26|was inactive ...}}; keep the value.
+_ABBR = re.compile(r"\{\{[Aa]bbr\|([^|}]+)(?:\|[^}]*)?\}\}")
 # TH rows: {{TH|start — end|Team|annotation}}; template name is case-insensitive.
 _TH_ENTRY = re.compile(r"\{\{[Tt][Hh]\|([^|}]+)\|([^|}]+?)(?:\|([^}]*))?\}\}")
-_PERSON_ROW = re.compile(r"\{\{[Pp]erson\|(.*?)\}\}")
 
 # Game section headers inside team_history, longest prefix first.
 _GAME_TAGS = [
@@ -83,29 +84,50 @@ def clean(value: str) -> str:
     return _WIKI_MARKUP.sub("", _HTML_COMMENT.sub("", value)).strip()
 
 
+def classify_page(wikitext: str) -> str:
+    """Guess the page kind from its infobox, so tools can refuse mismatches.
+
+    Returns ``player``, ``team``, ``tournament``, ``disambiguation`` or
+    ``unknown``. Only templates that are actually present are considered;
+    nothing is inferred from the title.
+    """
+    text = _HTML_COMMENT.sub("", wikitext).lower()
+    if "{{infobox player" in text:
+        return "player"
+    if "{{infobox team" in text or "{{squad|" in text:
+        return "team"
+    if "{{infobox league" in text or "{{infobox tournament" in text:
+        return "tournament"
+    if "{{disambiguation" in text or "{{disambig" in text:
+        return "disambiguation"
+    return "unknown"
+
+
+def _template_body_at(text: str, start: int) -> str | None:
+    """Inner text of the ``{{...}}`` starting at ``start`` (balanced braces)."""
+    depth, i = 0, start
+    while i < len(text) - 1:
+        if text[i : i + 2] == "{{":
+            depth += 1
+            i += 2
+        elif text[i : i + 2] == "}}":
+            depth -= 1
+            i += 2
+            if depth == 0:
+                return text[start + 2 : i - 2]
+        else:
+            i += 1
+    return None
+
+
 def extract_template(wikitext: str, name: str) -> str | None:
     """Return the inner text of the first ``{{name ...}}`` (balanced braces).
 
     Template names are matched case-insensitively: MediaWiki treats
     ``{{infobox player}}`` and ``{{Infobox player}}`` as the same template.
     """
-    lowered = wikitext.lower()
-    start = lowered.find("{{" + name.lower())
-    if start < 0:
-        return None
-    depth, i = 0, start
-    while i < len(wikitext) - 1:
-        if wikitext[i : i + 2] == "{{":
-            depth += 1
-            i += 2
-        elif wikitext[i : i + 2] == "}}":
-            depth -= 1
-            i += 2
-            if depth == 0:
-                return wikitext[start + 2 : i - 2]
-        else:
-            i += 1
-    return None
+    start = wikitext.lower().find("{{" + name.lower())
+    return _template_body_at(wikitext, start) if start >= 0 else None
 
 
 def parse_template_params(block: str) -> dict[str, str]:
@@ -136,7 +158,7 @@ def _flush_param(params: dict[str, str], chars: list[str]) -> None:
 
 def parse_date(raw: str) -> DateValue | None:
     """Parse common Liquipedia date shapes, keeping original precision."""
-    text = clean(raw)
+    text = clean(_ABBR.sub(r"\1", raw))
     if not text or text.lower() in {"present", "??", "?"}:
         return None
     # Wildcard years: "201?" spans 2010-2019, "20??" spans the 2000s.
@@ -251,11 +273,14 @@ class SquadEntry:
     real_name: str | None = None
     nationality: str | None = None
     roles: list[str] = field(default_factory=list)
+    role_label: str | None = None  # role exactly as written (Coach, Analyst, ...)
+    link: str | None = None        # explicit page title, when the row overrides it
     staff: bool = False            # coach / manager / ... excluded as teammate
     substitute: bool = False
     join: DateValue | None = None
     leave: DateValue | None = None
     section: str = "active"        # which squad table the row belongs to
+    kind: str = "players"          # players / staff
 
 
 def _normalize_role(raw: str) -> str:
@@ -443,11 +468,11 @@ def _same_team(a: str | None, b: str | None) -> bool:
 
 
 def first_active_squad(entries: list[SquadEntry]) -> list[SquadEntry]:
-    """Rows of the first 'active' table only — the current-game roster."""
+    """Rows of the first active players table — the current-game roster."""
     collecting = False
     rows: list[SquadEntry] = []
     for entry in entries:
-        if entry.section == "active":
+        if entry.kind == "players" and entry.section == "active":
             collecting = True
             rows.append(entry)
         elif collecting:
@@ -459,25 +484,30 @@ def parse_squads(wikitext: str) -> list[SquadEntry]:
     """Every ``{{Person}}`` row on a team page, tagged with its table.
 
     The first ``active`` squad belongs to the current (CS2) tab; older
-    game tabs repeat the pattern further down the page.
+    game tabs and separate staff squads repeat the pattern further down.
     """
     entries: list[SquadEntry] = []
-    section = "none"
+    section, kind = "none", "players"
     for line in wikitext.splitlines():
-        squad = re.search(r"\{\{[Ss]quad\|status=(\w+)", line)
-        if squad:
-            section = squad.group(1)
+        # Squad headers may put type= before status=, so look for either.
+        if re.search(r"\{\{[Ss]quad\|", line):
+            status = re.search(r"\bstatus=(\w+)", line)
+            section = status.group(1) if status else "none"
+            kind = "staff" if re.search(r"\btype=staff\b", line) else "players"
             continue
         if "Stand-ins table" in line or "{{Stand-ins" in line:
-            section = "standin"
+            section, kind = "standin", "players"
             continue
         if line.strip() == "}}":
-            section = "none"
+            section, kind = "none", "players"
             continue
-        row = _PERSON_ROW.search(line)
-        if not row or section == "none":
+        row_start = line.lower().find("{{person|")
+        if row_start < 0 or section == "none":
             continue
-        params = parse_template_params(row.group(1))
+        row = _template_body_at(line, row_start)
+        if row is None:
+            continue
+        params = parse_template_params(row)
         role_raw = clean(params.get("role", "")).lower()
         entries.append(
             SquadEntry(
@@ -485,11 +515,14 @@ def parse_squads(wikitext: str) -> list[SquadEntry]:
                 real_name=clean(params.get("name", "")) or None,
                 nationality=_FLAG_NAMES.get(clean(params.get("flag", "")).lower()),
                 roles=(["IGL"] if params.get("igl", "").strip().lower() == "y" else []),
-                staff=_is_staff_role(role_raw),
+                role_label=clean(params.get("role", "")) or None,
+                link=clean(params.get("link", "")) or None,
+                staff=kind == "staff" or _is_staff_role(role_raw),
                 substitute=role_raw in _SUBSTITUTE_ROLES,
                 join=parse_date(params.get("joindate", "")),
                 leave=parse_date(params.get("leavedate", "")),
                 section=section,
+                kind=kind,
             )
         )
     return entries

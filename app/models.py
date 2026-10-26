@@ -52,6 +52,43 @@ class TeamRef(BaseModel):
     url: str | None = None
 
 
+class TeamInfo(BaseModel):
+    """Identity of a team page, as resolved by the wiki."""
+
+    name: str
+    page_id: int | None = None
+    url: str
+
+
+class RosterRelation(StrEnum):
+    CONFIRMED = "confirmed"
+    SUBSTITUTE = "substitute"
+
+
+class RosterMember(BaseModel):
+    """One active-roster player on a team page."""
+
+    player_id: str                     # page title used for further lookups
+    nickname: str
+    real_name: str | None = None
+    nationality: str | None = None
+    age: int | None = None
+    roles: list[str] = Field(default_factory=list)
+    joined_at: DateValue | None = None
+    relation: RosterRelation = RosterRelation.CONFIRMED
+    source: Source | None = None
+
+
+class StaffMember(BaseModel):
+    """One active staff member; kept apart from the playing roster."""
+
+    nickname: str
+    real_name: str | None = None
+    nationality: str | None = None
+    role: str | None = None
+    joined_at: DateValue | None = None
+
+
 class TeamStatus(StrEnum):
     ACTIVE = "active"
     NONE = "none"          # page explicitly states the player has no team
@@ -145,6 +182,14 @@ class CareerResult(BaseModel):
     stints: list[CareerStint] = Field(default_factory=list)
 
 
+class TeamRosterResult(BaseModel):
+    """The payload of get_team_roster (PRD 2026-10-26 issue-fix P0-01)."""
+
+    team: TeamInfo
+    roster: list[RosterMember] = Field(default_factory=list)
+    staff: list[StaffMember] = Field(default_factory=list)
+
+
 class OverlapWindow(BaseModel):
     """Verified overlap between two stints (PRD feature 2)."""
 
@@ -175,14 +220,32 @@ class KinshipRecord(BaseModel):
     source_page: str
 
 
+class OmittedRecords(BaseModel):
+    """Shared stints hidden from the default relationship answer."""
+
+    count: int
+    reason: str
+
+
 class RelationshipResult(BaseModel):
     """The payload of get_player_relationship (PRD feature 2)."""
 
     player_a: Player
     player_b: Player
     shared_teams: list[SharedTeamRecord] = Field(default_factory=list)
+    omitted: OmittedRecords | None = None
     kinship: KinshipRecord | None = None
-    summary: str | None = None
+    summary: str
+
+
+class ErrorInfo(BaseModel):
+    """Machine-readable failure, separate from data-missing warnings."""
+
+    code: str
+    message: str
+    given: str | None = None
+    resolved_as: str | None = None
+    suggestion: str | None = None
 
 
 class Envelope(BaseModel):
@@ -191,7 +254,9 @@ class Envelope(BaseModel):
     status: JobStatus | str
     job_id: str | None = None
     player_id: str | None = None
-    result: NetworkResult | CareerResult | RelationshipResult | None = None
+    result: (
+        NetworkResult | CareerResult | RelationshipResult | TeamRosterResult | None
+    ) = None
     progress: str | None = None
     fetched_at: datetime | None = None
     served_at: datetime = Field(default_factory=utcnow)
@@ -200,4 +265,4 @@ class Envelope(BaseModel):
     license_url: str = LICENSE_URL
     warnings: list[str] = Field(default_factory=list)
     truncated: bool = False
-    error: str | None = None
+    error: ErrorInfo | None = None

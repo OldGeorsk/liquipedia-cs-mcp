@@ -3,7 +3,7 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 APP_NAME = "liquipedia-cs-mcp"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 
 # Liquipedia text is CC BY-SA 3.0; every result must carry this attribution.
 LICENSE_NAME = "CC BY-SA 3.0"
@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     request_timeout: float = 30.0
     cache_ttl_seconds: float = 86400.0  # one day
     page_budget_per_job: int = 30
+    # A job without a heartbeat this long is declared failed, not "running".
+    job_stall_seconds: float = 60.0
     # Titles per batched query request; keeps responses modest in size.
     batch_page_limit: int = 10
 

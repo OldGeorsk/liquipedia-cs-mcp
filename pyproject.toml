@@ -1,6 +1,6 @@
 [project]
 name = "liquipedia-cs-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local MCP server for Liquipedia Counter-Strike player lookups (MVP)"
 requires-python = ">=3.12"
 dependencies = [

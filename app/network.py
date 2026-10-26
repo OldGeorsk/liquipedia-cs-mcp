@@ -13,15 +13,16 @@ from datetime import datetime, timezone
 from app.config import Settings
 from app.liquipedia import LiquipediaClient, ProviderError, RateLimited, page_url
 from app.models import (
-    CareerResult, CareerStint, Envelope, JobStatus, KinshipRecord,
-    NetworkResult, OverlapWindow, Player, PreviousTeamGroup,
-    RelationConfidence, RelationshipResult, SharedTeamRecord, Source,
+    CareerResult, CareerStint, Envelope, ErrorInfo, JobStatus, KinshipRecord,
+    NetworkResult, OmittedRecords, OverlapWindow, Player, PreviousTeamGroup,
+    RelationConfidence, RelationshipResult, RosterMember, RosterRelation,
+    SharedTeamRecord, Source, StaffMember, TeamInfo, TeamRosterResult,
     TeamStatus, Teammate,
 )
 from app.parsing import (
-    SquadEntry, date_bounds, find_kinship, first_active_squad, name_key,
-    other_names_for, overlap_verdict, parse_career, parse_player, parse_squads,
-    parse_team_history, recent_previous_teams,
+    SquadEntry, classify_page, date_bounds, find_kinship, first_active_squad,
+    name_key, other_names_for, overlap_verdict, parse_career, parse_player,
+    parse_squads, parse_team_history, recent_previous_teams,
 )
 from app.store import Store
 
@@ -32,6 +33,31 @@ class _BudgetExhausted(Exception):
 
 class _Paused(Exception):
     """Raised when upstream throttling refuses to let the job continue."""
+
+
+class InvalidResource(Exception):
+    """The page exists but is not the kind of resource this tool needs.
+
+    Tools turn this into an MCP ``isError`` result with a code and a
+    concrete alternative, so an agent never receives a silent empty answer.
+    """
+
+    def __init__(self, given: str, resolved_as: str, expected: str, suggestion: str):
+        self.given = given
+        self.resolved_as = resolved_as
+        self.expected = expected
+        self.suggestion = suggestion
+        if resolved_as == "unknown":
+            message = f"could not confirm '{given}' is a {expected} page"
+        else:
+            message = f"'{given}' is a {resolved_as} page; expected a {expected} page"
+        super().__init__(message)
+
+    def as_error(self) -> ErrorInfo:
+        return ErrorInfo(
+            code="invalid_resource_type", message=str(self), given=self.given,
+            resolved_as=self.resolved_as, suggestion=self.suggestion,
+        )
 
 
 _STAFF_HINTS = ("coach", "manager", "analyst", "owner", "ceo")
@@ -51,12 +77,28 @@ class PlayerNetworkService:
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._worker: asyncio.Task | None = None
         self._missing_pages: set[str] = set()
+        # Jobs this process owns (queued or being processed). A job with an
+        # old heartbeat that is *not* in here was orphaned by a restart.
+        self._known_jobs: set[str] = set()
 
     # -- lifecycle ----------------------------------------------------------
 
     async def start(self) -> None:
-        # Jobs still marked running after a restart are re-queued; their
-        # stages survive in SQLite and cached pages make the resume cheap.
+        # A restart leaves jobs in queued/running state. Re-queue them so
+        # cached pages can finish the work instead of polling forever.
+        if self._worker is not None and not self._worker.done():
+            return
+        for job in self._store.unfinished_jobs():
+            stages = job["stages"]
+            warnings = stages.setdefault("warnings", [])
+            if "resumed after server restart" not in warnings:
+                warnings.append("resumed after server restart")
+            self._store.save_job(
+                job["job_id"], job["player_id"], JobStatus.QUEUED,
+                stages, job["budget_used"],
+            )
+            self._known_jobs.add(job["job_id"])
+            self._queue.put_nowait(job["job_id"])
         self._worker = asyncio.create_task(self._run_worker())
 
     async def stop(self) -> None:
@@ -66,15 +108,18 @@ class PlayerNetworkService:
                 await self._worker
             except asyncio.CancelledError:
                 pass
+            self._worker = None
 
     async def _run_worker(self) -> None:
         while True:
             job_id = await self._queue.get()
+            self._known_jobs.add(job_id)
             try:
                 await self._process(job_id)
             except Exception as exc:  # defensive: a bug must not kill the worker
-                self._fail(job_id, f"internal error: {exc}")
+                self._fail(job_id, f"internal error: {exc}", code="internal_error")
             finally:
+                self._known_jobs.discard(job_id)
                 self._queue.task_done()
 
     # -- public API (used by MCP tools) --------------------------------------
@@ -82,6 +127,23 @@ class PlayerNetworkService:
     async def lookup(self, player_id: str) -> Envelope:
         """Return a cached result, or hand the player to the job queue."""
         player_id = player_id.strip()
+
+        # Validate the page kind first, even when a job result is cached:
+        # stale results for team pages must never be served as player data.
+        try:
+            page = await self._fetch(player_id, None)
+        except RateLimited as exc:
+            return Envelope(
+                status=JobStatus.FAILED, player_id=player_id,
+                error=ErrorInfo(code="rate_limited", message=str(exc), given=player_id),
+            )
+        except ProviderError as exc:
+            return Envelope(
+                status=JobStatus.FAILED, player_id=player_id,
+                error=ErrorInfo(code=exc.code, message=str(exc), given=player_id),
+            )
+        self._require_player(page, player_id)
+
         existing = self._store.latest_job_for_player(player_id)
         if existing and existing["status"] == JobStatus.COMPLETE:
             age = datetime.now(timezone.utc).timestamp() - datetime.fromisoformat(
@@ -91,18 +153,27 @@ class PlayerNetworkService:
                 return self._envelope(existing, served_from_cache=True)
 
         if existing and existing["status"] in (JobStatus.QUEUED, JobStatus.RUNNING):
-            return Envelope(
-                status=existing["status"], job_id=existing["job_id"], player_id=player_id,
-                progress=self._progress_line(existing),
-            )
+            checked = await self.result(existing["job_id"])
+            if checked is not None and checked.status in (
+                JobStatus.QUEUED, JobStatus.RUNNING
+            ):
+                return checked
+            # The job was orphaned and has just been marked failed: start over.
 
-        # partial / paused / stale-complete: create a resuming job (cache pays).
-        stages = existing["stages"] if existing else {}
-        stages.setdefault("warnings", [])
-        if existing:
-            stages["warnings"].append("resumed from a previous incomplete job")
+        # Only partial/paused jobs are resumed; an expired complete or failed
+        # job starts from a clean slate so stale stage data is never reused.
+        if existing and existing["status"] in (JobStatus.PARTIAL, JobStatus.PAUSED):
+            stages = existing["stages"]
+            stages.setdefault("warnings", []).append(
+                "resumed from a previous incomplete job"
+            )
+        else:
+            stages = {"warnings": []}
+            if existing and existing["status"] == JobStatus.COMPLETE:
+                stages["warnings"].append("refreshing an expired cached result")
         job_id = uuid.uuid4().hex[:12]
         self._store.save_job(job_id, player_id, JobStatus.QUEUED, stages, 0)
+        self._known_jobs.add(job_id)
         self._queue.put_nowait(job_id)
         return Envelope(
             status=JobStatus.QUEUED, job_id=job_id, player_id=player_id,
@@ -111,7 +182,44 @@ class PlayerNetworkService:
 
     async def result(self, job_id: str) -> Envelope | None:
         job = self._store.get_job(job_id)
+        if not job:
+            return None
+        if job["status"] in (JobStatus.QUEUED, JobStatus.RUNNING) and (
+            job_id not in self._known_jobs
+        ):
+            heartbeat = job.get("heartbeat_at") or job.get("updated_at")
+            age = datetime.now(timezone.utc).timestamp() - datetime.fromisoformat(
+                heartbeat
+            ).timestamp() if heartbeat else 0
+            if age > self._settings.job_stall_seconds:
+                self._store.save_job(
+                    job_id, job["player_id"], JobStatus.FAILED, job["stages"],
+                    job["budget_used"],
+                    error=ErrorInfo(
+                        code="job_stalled",
+                        message=(
+                            f"job made no progress for {int(age)}s; "
+                            "call get_player_network again to start a fresh lookup"
+                        ),
+                    ),
+                )
+                job = self._store.get_job(job_id)
         return self._envelope(job) if job else None
+
+    async def wait(self, job_id: str, wait_ms: int) -> Envelope | None:
+        """Block until the job settles or ``wait_ms`` elapses."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0, wait_ms) / 1000
+        while True:
+            envelope = await self.result(job_id)
+            if envelope is None or envelope.status not in (
+                JobStatus.QUEUED, JobStatus.RUNNING
+            ):
+                return envelope
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return envelope
+            await asyncio.sleep(min(0.25, remaining))
 
     async def career(self, player_id: str) -> Envelope:
         """Full recorded team history of one player (PRD feature 1).
@@ -121,9 +229,17 @@ class PlayerNetworkService:
         player_id = player_id.strip()
         try:
             page = await self._fetch(player_id, None)
-        except (ProviderError, RateLimited) as exc:
-            return Envelope(status=JobStatus.FAILED, player_id=player_id,
-                            error=f"lookup failed: {exc}")
+        except RateLimited as exc:
+            return Envelope(
+                status=JobStatus.FAILED, player_id=player_id,
+                error=ErrorInfo(code="rate_limited", message=str(exc), given=player_id),
+            )
+        except ProviderError as exc:
+            return Envelope(
+                status=JobStatus.FAILED, player_id=player_id,
+                error=ErrorInfo(code=exc.code, message=str(exc), given=player_id),
+            )
+        self._require_player(page, player_id)
         player = parse_player(
             page.wikitext, title=page.title, page_id=page.page_id,
             settings=self._settings, revision_id=page.revision_id,
@@ -140,22 +256,162 @@ class PlayerNetworkService:
             warnings=warnings,
         )
 
-    async def relationship(self, player_a: str, player_b: str) -> Envelope:
+    async def roster(self, team_id: str, include_staff: bool = True) -> Envelope:
+        """Current active roster of one team (PRD 2026-10-26 issue-fix P0-01).
+
+        One team page plus one batched member-page request (cache-served when
+        fresh). Staff are kept apart from the playing roster.
+        """
+        team_id = team_id.strip()
+        try:
+            page = await self._fetch(team_id, None)
+        except RateLimited as exc:
+            return Envelope(
+                status=JobStatus.FAILED,
+                error=ErrorInfo(code="rate_limited", message=str(exc), given=team_id),
+            )
+        except ProviderError as exc:
+            return Envelope(
+                status=JobStatus.FAILED,
+                error=ErrorInfo(code=exc.code, message=str(exc), given=team_id),
+            )
+        self._require_team(page, team_id)
+
+        rows = parse_squads(page.wikitext)
+        active = first_active_squad(rows)
+        players = [r for r in active if not r.staff and r.nickname]
+        active_staff = [r for r in rows if r.kind == "staff" and r.section == "active"]
+        staff_rows: list[SquadEntry] = []
+        seen_staff: set[str] = set()
+        for row in [r for r in active if r.staff] + active_staff:
+            key = name_key(row.nickname or row.real_name or "")
+            if not key or key in seen_staff:
+                continue
+            seen_staff.add(key)
+            staff_rows.append(row)
+
+        warnings: list[str] = []
+        if not active:
+            warnings.append("no active player squad found on the team page")
+
+        titles = list(dict.fromkeys(self._row_title(r) for r in players))
+        titles = [t for t in titles if t]
+        try:
+            batch = await self._client.get_wikitext_many(titles) if titles else None
+        except RateLimited as exc:
+            return Envelope(
+                status=JobStatus.FAILED,
+                error=ErrorInfo(code="rate_limited", message=str(exc), given=team_id),
+            )
+        except ProviderError as exc:
+            return Envelope(
+                status=JobStatus.FAILED,
+                error=ErrorInfo(code=exc.code, message=str(exc), given=team_id),
+            )
+        pages = batch.pages if batch else {}
+        missing = batch.missing if batch else set()
+
+        roster: list[RosterMember] = []
+        for row in players:
+            title = self._row_title(row)
+            member_page = pages.get(title)
+            profile = None
+            if member_page is not None:
+                profile = parse_player(
+                    member_page.wikitext, title=member_page.title,
+                    page_id=member_page.page_id, settings=self._settings,
+                    revision_id=member_page.revision_id,
+                    fetched_at=member_page.fetched_at,
+                )
+            elif title in missing:
+                warnings.append(f"profile page unavailable for {row.nickname}")
+            roles = list(dict.fromkeys(
+                [*row.roles, *(profile.roles if profile else [])]
+            ))
+            roster.append(RosterMember(
+                player_id=member_page.title if member_page else (title or row.nickname),
+                nickname=row.nickname,
+                real_name=(profile.real_name if profile else None) or row.real_name,
+                nationality=(profile.nationality if profile else None) or row.nationality,
+                age=profile.age if profile else None,
+                roles=roles,
+                joined_at=row.join,
+                relation=(
+                    RosterRelation.SUBSTITUTE if row.substitute
+                    else RosterRelation.CONFIRMED
+                ),
+                source=profile.sources[0] if profile and profile.sources else None,
+            ))
+
+        staff = [
+            StaffMember(
+                nickname=row.nickname or row.real_name or "unknown",
+                real_name=row.real_name,
+                nationality=row.nationality,
+                role=row.role_label or (", ".join(row.roles) or None),
+                joined_at=row.join,
+            )
+            for row in staff_rows
+        ] if include_staff else []
+
+        sources = [self._source_of_page(page)]
+        seen_sources = {page.title}
+        for member_page in pages.values():
+            if member_page.title not in seen_sources:
+                seen_sources.add(member_page.title)
+                sources.append(self._source_of_page(member_page))
+        return Envelope(
+            status=JobStatus.COMPLETE,
+            result=TeamRosterResult(
+                team=TeamInfo(
+                    name=page.title, page_id=page.page_id,
+                    url=page_url(self._settings, page.title),
+                ),
+                roster=roster, staff=staff,
+            ),
+            fetched_at=page.fetched_at, sources=sources, warnings=warnings,
+        )
+
+    async def relationship(
+        self, player_a: str, player_b: str, include_non_overlapping: bool = False,
+    ) -> Envelope:
         """Shared-tenure and kinship judgment between two players (PRD feature 2).
 
-        Costs one batched request for both pages when cold.
+        Costs one batched request for both pages when cold. Non-overlapping
+        shared stints are hidden by default and summarised in ``omitted``.
         """
         a_id, b_id = player_a.strip(), player_b.strip()
         if name_key(a_id) == name_key(b_id):
-            return Envelope(status=JobStatus.FAILED, error="player_a and player_b are the same")
+            return Envelope(
+                status=JobStatus.FAILED,
+                error=ErrorInfo(code="same_player",
+                                message="player_a and player_b are the same"),
+            )
         try:
             batch = await self._client.get_wikitext_many([a_id, b_id])
         except RateLimited as exc:
-            return Envelope(status=JobStatus.FAILED, error=f"rate limited: {exc}")
+            return Envelope(
+                status=JobStatus.FAILED,
+                error=ErrorInfo(code="rate_limited", message=str(exc)),
+            )
+        except ProviderError as exc:
+            return Envelope(
+                status=JobStatus.FAILED,
+                error=ErrorInfo(code=exc.code, message=str(exc)),
+            )
         missing = [t for t in (a_id, b_id) if t in batch.missing]
         if missing:
-            return Envelope(status=JobStatus.FAILED, error=f"player page not found: {', '.join(missing)}")
+            return Envelope(
+                status=JobStatus.FAILED,
+                error=ErrorInfo(
+                    code="page_missing",
+                    message=f"player page not found: {', '.join(missing)}",
+                    given=", ".join(missing),
+                ),
+            )
         a_page, b_page = batch.pages[a_id], batch.pages[b_id]
+        self._require_player(a_page, a_id)
+        self._require_player(b_page, b_id)
         a_player = parse_player(a_page.wikitext, title=a_page.title, page_id=a_page.page_id,
                                 settings=self._settings, revision_id=a_page.revision_id,
                                 fetched_at=a_page.fetched_at)
@@ -174,41 +430,68 @@ class PlayerNetworkService:
                 b_key = name_key(self._store.canonical_title(b_stint.team.name))
                 if a_key != b_key or not a_key:
                     continue
+                overlap = self._overlap_window(a_stint, b_stint)
+                playing = self._playing_together(
+                    a_player, b_player, a_stint, b_stint
+                ) and overlap.verdict != "none"
                 records.append(SharedTeamRecord(
                     team=a_stint.team,
                     canonical_team=(a_stint.canonical_team or b_stint.canonical_team),
                     a_stint=a_stint, b_stint=b_stint,
-                    overlap=self._overlap_window(a_stint, b_stint),
-                    playing_together=self._playing_together(a_player, b_player, a_stint, b_stint),
+                    overlap=overlap, playing_together=playing,
                     games=sorted({g for g in (a_stint.game, b_stint.game) if g != "unknown"}),
                 ))
         records.sort(key=lambda r: (name_key(r.team.name),
                                     r.a_stint.start.raw if r.a_stint.start else ""))
+
+        omitted = [r for r in records if r.overlap.verdict == "none"]
+        visible = records if include_non_overlapping else [
+            r for r in records if r.overlap.verdict != "none"
+        ]
 
         kinship = find_kinship(
             a_page.wikitext, other_names_for(b_player, b_page.title), a_page.title,
         ) or find_kinship(
             b_page.wikitext, other_names_for(a_player, a_page.title), b_page.title,
         )
-        confirmed = sum(1 for r in records if r.overlap.verdict == "confirmed")
+        confirmed = sum(1 for r in visible if r.overlap.verdict == "confirmed")
+        unconfirmed = sum(1 for r in visible if r.overlap.verdict == "unconfirmed")
         warnings = []
         if not a_stints:
             warnings.append(f"no team history recorded for {a_player.nickname}")
         if not b_stints:
             warnings.append(f"no team history recorded for {b_player.nickname}")
-        if not records and not kinship:
+        if not visible and not kinship:
             warnings.append("no shared team records found; this is not proof of no relation")
-        summary = (
-            f"{confirmed} confirmed shared stint(s) at "
-            f"{len({name_key(r.team.name) for r in records if r.overlap.verdict == 'confirmed'})} team(s)"
-            if confirmed else ("no overlapping shared stints found" if records else None)
-        )
+        if confirmed:
+            summary = (
+                f"{confirmed} confirmed shared stint(s) at "
+                f"{len({name_key(r.team.name) for r in visible if r.overlap.verdict == 'confirmed'})} team(s)"
+            )
+        elif unconfirmed:
+            summary = (
+                f"no confirmed shared stints; {unconfirmed} stint(s) with "
+                f"unconfirmed overlap at {len({name_key(r.team.name) for r in visible})} team(s)"
+            )
+        elif kinship:
+            summary = "no shared team records found; an explicit kinship relation is recorded"
+        else:
+            summary = "no overlapping shared stints found"
         fetched = max(x.fetched_at for x in (a_page, b_page))
         return Envelope(
             status=JobStatus.COMPLETE,
-            result=RelationshipResult(player_a=a_player, player_b=b_player,
-                                      shared_teams=records, kinship=kinship,
-                                      summary=summary),
+            result=RelationshipResult(
+                player_a=a_player, player_b=b_player,
+                shared_teams=visible,
+                omitted=(
+                    None if include_non_overlapping or not omitted
+                    else OmittedRecords(
+                        count=len(omitted),
+                        reason="shared team(s) without an overlapping stint",
+                    )
+                ),
+                kinship=kinship, summary=summary,
+            ),
             fetched_at=fetched,
             sources=self._sources_of(a_player) + self._sources_of(b_player),
             warnings=warnings,
@@ -226,6 +509,7 @@ class PlayerNetworkService:
         warnings: list[str] = stages.get("warnings", [])
         sources: dict[str, dict] = stages.get("sources", {})
         self._set_status(job_id, player_id, JobStatus.RUNNING, stages, budget.used)
+        heartbeat = asyncio.create_task(self._heartbeat(job_id))
 
         try:
             player = await self._load_target(job_id, player_id, stages, budget, sources)
@@ -240,17 +524,33 @@ class PlayerNetworkService:
             stages["result"] = result.model_dump(mode="json")
             self._store.save_job(
                 job_id, player_id, JobStatus.PARTIAL, stages, budget.used,
-                error="page budget exhausted; call get_player_network again to resume",
+                error=ErrorInfo(
+                    code="page_budget_exhausted",
+                    message="page budget exhausted; call get_player_network again to resume",
+                ),
             )
             return
         except _Paused as exc:
             self._store.save_job(
-                job_id, player_id, JobStatus.PAUSED, stages, budget.used, error=str(exc)
+                job_id, player_id, JobStatus.PAUSED, stages, budget.used,
+                error=ErrorInfo(code="rate_limited", message=str(exc)),
+            )
+            return
+        except InvalidResource as exc:
+            self._store.save_job(
+                job_id, player_id, JobStatus.FAILED, stages, budget.used,
+                error=exc.as_error(),
             )
             return
         except ProviderError as exc:
-            self._fail(job_id, f"upstream error: {exc}")
+            self._fail(job_id, f"upstream error: {exc}", code=exc.code)
             return
+        finally:
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
 
         result = NetworkResult(player=player, current_teammates=current,
                                previous_teams=previous)
@@ -260,12 +560,19 @@ class PlayerNetworkService:
         status = JobStatus.PARTIAL if budget.exhausted else JobStatus.COMPLETE
         self._store.save_job(job_id, player_id, status, stages, budget.used)
 
+    async def _heartbeat(self, job_id: str) -> None:
+        """Keep a running job's heartbeat fresh during long batch phases."""
+        while True:
+            await asyncio.sleep(10)
+            self._store.touch_job(job_id)
+
     # -- stages ----------------------------------------------------------------
 
     async def _load_target(self, job_id, player_id, stages, budget, sources) -> Player:
         if "player" in stages:
             return Player.model_validate(stages["player"])
         page = await self._fetch(player_id, budget)
+        self._require_player(page, player_id)
         self._remember_source(sources, page)
         player = parse_player(
             page.wikitext, title=page.title, page_id=page.page_id,
@@ -298,12 +605,14 @@ class PlayerNetworkService:
             r for r in rows
             if not r.staff and r.nickname and r.nickname != player.nickname
         ]
-        pages = await self._fetch_batch([r.nickname for r in rows], budget)
+        pages = await self._fetch_batch([self._row_title(r) for r in rows], budget)
         for page in pages.values():
             self._remember_source(sources, page)
         teammates = [
-            self._teammate_from_row(row, team, pages.get(row.nickname),
-                                    relation=RelationConfidence.CONFIRMED)
+            self._teammate_from_row(
+                row, team, pages.get(self._row_title(row)),
+                relation=RelationConfidence.CONFIRMED,
+            )
             for row in rows
         ]
         stages["current_teammates"] = [t.model_dump(mode="json") for t in teammates]
@@ -371,14 +680,15 @@ class PlayerNetworkService:
 
         all_rows = [entry for rows in member_rows.values() for entry in rows]
         member_pages = await self._fetch_batch(
-            [entry[0].nickname for entry in all_rows], budget
+            [self._row_title(entry[0]) for entry in all_rows], budget
         )
         for page in member_pages.values():
             self._remember_source(sources, page)
         for group in groups:
             for row, relation, team in member_rows.get(group.tenure.team.name, []):
                 teammate = self._teammate_from_row(
-                    row, team, member_pages.get(row.nickname), relation=relation
+                    row, team, member_pages.get(self._row_title(row)),
+                    relation=relation,
                 )
                 if relation == RelationConfidence.CONFIRMED:
                     group.teammates.append(teammate)
@@ -464,6 +774,57 @@ class PlayerNetworkService:
     @staticmethod
     def _sources_of(player: Player) -> list[Source]:
         return list(player.sources)
+
+    def _source_of_page(self, page) -> Source:
+        return Source(
+            page=page.title, page_id=page.page_id,
+            url=page_url(self._settings, page.title),
+            revision_id=page.revision_id, fetched_at=page.fetched_at,
+        )
+
+    def _require_player(self, page, given: str) -> None:
+        kind = classify_page(page.wikitext)
+        if kind == "player":
+            return
+        if kind == "team":
+            suggestion = f'use get_team_roster(team_id="{page.title}")'
+        elif kind in ("tournament", "disambiguation"):
+            suggestion = (
+                f'use search_players(query="{given}") to find a player page '
+                f'(this is a {kind} page)'
+            )
+        else:
+            suggestion = (
+                f'use search_players(query="{given}") to resolve the page title first'
+            )
+        raise InvalidResource(given, kind, "player", suggestion)
+
+    def _require_team(self, page, given: str) -> None:
+        kind = classify_page(page.wikitext)
+        if kind == "team":
+            return
+        if kind == "player":
+            suggestion = (
+                f'use get_player_career(player_id="{page.title}") '
+                "for a player page"
+            )
+        elif kind in ("tournament", "disambiguation"):
+            suggestion = (
+                f'use search_players(query="{given}") to resolve the title first '
+                f'(this is a {kind} page)'
+            )
+        else:
+            suggestion = (
+                f'use search_players(query="{given}") to resolve the page title first'
+            )
+        raise InvalidResource(given, kind, "team", suggestion)
+
+    @staticmethod
+    def _row_title(row: SquadEntry) -> str:
+        """Page title for a roster row; explicit link wins when it is local."""
+        if row.link and ":" not in row.link:
+            return row.link
+        return row.nickname
 
     def _stamp_canonical(self, stint: CareerStint) -> None:
         """Fill canonical_team from recorded redirect aliases, once."""
@@ -580,7 +941,9 @@ class PlayerNetworkService:
             sources=[Source.model_validate(s) for s in stages.get("sources", {}).values()],
             warnings=warnings,
             truncated=job["status"] == JobStatus.PARTIAL,
-            error=job.get("error"),
+            error=(
+                ErrorInfo.model_validate(job["error"]) if job.get("error") else None
+            ),
         )
 
     def _progress_line(self, job: dict) -> str:
@@ -596,13 +959,13 @@ class PlayerNetworkService:
     def _set_status(self, job_id, player_id, status, stages, budget_used) -> None:
         self._store.save_job(job_id, player_id, status, stages, budget_used)
 
-    def _fail(self, job_id: str, message: str) -> None:
+    def _fail(self, job_id: str, message: str, code: str = "error") -> None:
         job = self._store.get_job(job_id)
         if not job:
             return
         self._store.save_job(
             job_id, job["player_id"], JobStatus.FAILED, job["stages"],
-            job["budget_used"], error=message,
+            job["budget_used"], error=ErrorInfo(code=code, message=message),
         )
 
     class _Budget:

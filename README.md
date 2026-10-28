@@ -1,4 +1,4 @@
-# liquipedia-cs-mcp
+# liquipedia-cs-mcp (v0.6.0)
 English | [简体中文](README.zh-CN.md)
 
 - Local MCP server that looks up Counter-Strike teams and players on [Liquipedia](https://liquipedia.net/counterstrike):

@@ -5,6 +5,7 @@ English | [简体中文](README.zh-CN.md)
 - current team rosters (players and staff kept apart), player profiles, current teammates, and the teammates of the three most recent previous teams;
 - full career histories (every stint with its game tag), and pairwise player relationships (verified shared stints, explicitly stated kinship);
 - team search that filters out player/tournament pages, and one-call relationship matrices across up to five rosters (or an explicit player list) with zero per-pair upstream requests;
+- a team's full tournament record (`/Results` history) with per-tier summaries, plus a generic `search_wiki` / `read_wiki_page` fallback that reaches any wiki page when no dedicated tool fits;
 - wrong resource types (a team page passed to a player tool, or the reverse) return `isError` with a machine-readable code and the right alternative instead of an empty success.
 
 ## Install
@@ -25,6 +26,8 @@ Register as a **stdio** server — the client spawns and manages the process its
   }
 }
 ```
+
+On macOS/Linux the command is `<clone>/.venv/bin/python`.
 
 - **ZCode** — `~/.zcode/cli/config.json` → `mcp.servers`
 - **Claude Desktop / Cursor** — the client's `mcpServers` config
@@ -50,7 +53,7 @@ Advanced (one shared instance for many clients, and the only mode ChatGPT deskto
 | `get_relationship_matrix` | `teams` (2–5) or `players` (2–20), `include_staff`, `include_non_overlapping`, `max_pairs` (1–500) | one call compares every cross-team pair: `connections[]`, `same_team_no_overlap[]`, `stats`, `skipped[]`; invalid teams fail the whole call, a missing player page yields `partial` |
 | `get_team_achievements` | `team_id`, `tier` (optional, e.g. `S-Tier` or `S`) | full tournament record from the team's `/Results` subpage: every row with date/placement/tier/tournament/score/opponent/prize, plus per-tier summaries (events/wins/runner-up/top4/prize) |
 | `search_wiki` | `query`, `limit` (1–20) | unfiltered full-text search over any page type — the fallback when dedicated tools miss |
-| `read_wiki_page` | `page`, `format` (`wikitext`/`html`), `section` | raw content of any page including subpages, capped at 40k chars; `html` is required for LPDB-generated tables (results, statistics) |
+| `read_wiki_page` | `title`, `format` (`wikitext`/`html`), `section` | raw content of any page including subpages, capped at 40k chars; `html` is required for LPDB-generated tables (results, statistics) |
 
 ## Configuration (env vars, `LIQUIPEDIA_` prefix)
 
@@ -64,5 +67,5 @@ Advanced (one shared instance for many clients, and the only mode ChatGPT deskto
 
 ## Compliance design
 
-- A single serialized scheduler paces every upstream request with randomized 2.3–3.0 s spacing (above Liquipedia's 2 s floor) and persists the clock in SQLite; 429s honor `Retry-After`, and page budgets keep every job resumable.
+- A single serialized scheduler paces every upstream request with randomized 2.3–3.0 s spacing (above Liquipedia's 2 s floor; rendered-page parse requests get a wider 33–35 s lane) and persists the clock in SQLite; 429s honor `Retry-After`, and page budgets keep every job resumable.
 - Page fetches are batched (`titles=A|B|C`, ≤10 titles per request), so a full network lookup costs roughly 7 upstream requests instead of ~30.

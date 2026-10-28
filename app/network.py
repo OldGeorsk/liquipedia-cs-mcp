@@ -434,7 +434,7 @@ class PlayerNetworkService:
                     message=f"no /Results subpage for {page.title}: {exc}",
                     given=team_id,
                     suggestion=(
-                        f'use read_wiki_page(page="{page.title}", format="html")'
+                        f'use read_wiki_page(title="{page.title}", format="html")'
                     ),
                 ),
             )

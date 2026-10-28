@@ -5,6 +5,7 @@
 - 现役战队阵容(选手与教练/工作人员分开)、个人资料、现队友,以及最近三支前队伍各自的队友;
 - 完整职业生涯履历(逐段带游戏项目标签),以及两名选手间的关系判定(经核验的共同效力、明文记载的亲属关系);
 - 队伍搜索(自动过滤选手/赛事/消歧义页),以及一次调用完成最多五支战队的交叉关系矩阵(或显式选手列表),不产生逐对上游请求;
+- 队伍完整赛事战绩(`/Results` 全量历史)与按级别汇总;另配 `search_wiki` / `read_wiki_page` 全站保底通道,专用工具未覆盖时仍可触达任意页面;
 - 资源类型不匹配时(把队伍页传给选手工具,或反过来)返回 `isError`、机器可读错误码和正确的替代工具,不再返回"成功但为空"的结果。
 
 ## 安装
@@ -25,6 +26,8 @@ python -m venv .venv
   }
 }
 ```
+
+macOS/Linux 下 command 为 `<克隆路径>/.venv/bin/python`。
 
 - **ZCode** — `~/.zcode/cli/config.json` → `mcp.servers`
 - **Claude Desktop / Cursor** — 客户端的 `mcpServers` 配置
@@ -50,7 +53,7 @@ python -m venv .venv
 | `get_relationship_matrix` | `teams`(2–5)或 `players`(2–20)、`include_staff`、`include_non_overlapping`、`max_pairs`(1–500) | 一次调用比较全部跨队 pair:输出 `connections[]`、`same_team_no_overlap[]`、`stats`、`skipped[]`;队伍无效则整次失败,个别选手页缺失返回 `partial` |
 | `get_team_achievements` | `team_id`、`tier`(可选,如 `S-Tier` 或 `S`) | 队伍 `/Results` 子页的完整赛事战绩:每行含日期/名次/级别/赛事/比分/对手/奖金,并附按级别汇总(场次/冠军/亚军/四强/总奖金) |
 | `search_wiki` | `query`、`limit`(1–20) | 不过滤页面类型的全站全文搜索——专用工具未覆盖时的保底入口 |
-| `read_wiki_page` | `page`、`format`(`wikitext`/`html`)、`section` | 任意页面(含子页)的原始内容,上限 4 万字符;LPDB 生成的表格(成绩、统计)需用 `html` |
+| `read_wiki_page` | `title`、`format`(`wikitext`/`html`)、`section` | 任意页面(含子页)的原始内容,上限 4 万字符;LPDB 生成的表格(成绩、统计)需用 `html` |
 
 ## 配置(环境变量,`LIQUIPEDIA_` 前缀)
 
@@ -64,7 +67,7 @@ python -m venv .venv
 
 ## 合规设计
 
-- 唯一的串行调度器为所有上游请求设定随机 2.3–3.0 秒的间隔,高于 Liquipedia 官方 2 秒下限
+- 唯一的串行调度器为所有上游请求设定随机 2.3–3.0 秒的间隔,高于 Liquipedia 官方 2 秒下限(渲染页 parse 请求使用更宽的 33–35 秒车道)
 - 计时状态持久化到 SQLite,服务重启后不会重置
 - 429 响应遵守 `Retry-After`,页面预算保证每个任务都可断点续跑
 - 页面抓取按多标题批量执行(`titles=A|B|C`,单请求最多 10 个标题),一次完整关系网查询约 7 次上游请求,而非约 30 次

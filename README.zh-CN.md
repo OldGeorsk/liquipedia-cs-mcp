@@ -1,4 +1,4 @@
-# liquipedia-cs-mcp (v0.6.0)
+# liquipedia-cs-mcp (v0.7.0)
 [English](README.md) | 简体中文
 
 - 本地 MCP 服务器,用于在 [Liquipedia](https://liquipedia.net/counterstrike) 上查询反恐精英(Counter-Strike)战队与选手:
@@ -8,36 +8,37 @@
 - 队伍完整赛事战绩(`/Results` 全量历史)与按级别汇总;另配 `search_wiki` / `read_wiki_page` 全站保底通道,专用工具未覆盖时仍可触达任意页面;
 - 资源类型不匹配时(把队伍页传给选手工具,或反过来)返回 `isError`、机器可读错误码和正确的替代工具,不再返回"成功但为空"的结果。
 
-## 安装
+## 安装与注册(stdio——客户端自行拉起服务,不占端口)
 
-```bash
-python -m venv .venv
-.venv/Scripts/pip install -e .             # Windows;其他系统使用 .venv/bin/pip
-```
+最省事——把这句话丢给任意 agent:
 
-注册为 **stdio** 服务器——客户端自行拉起并托管进程:不占端口、无需手动启动。把 `D:/src/liquipedia-mcp` 替换为你的克隆路径:
+> "从 https://github.com/OldGeorsk/liquipedia-cs-mcp 安装 Liquipedia CS MCP 服务器(pip install git+https://github.com/OldGeorsk/liquipedia-cs-mcp,或用 uvx 运行),以 stdio 方式注册名为 `liquipedia-cs-mcp` 的 MCP 服务器,env 设置 `LIQUIPEDIA_CONTACT=<我的邮箱>`,然后验证连接。"
+
+手动配置:
+
+用 [uv](https://docs.astral.sh/uv/)——免建虚拟环境(args 里加 `--refresh` 可拉取新提交):
 
 ```json
 {
   "liquipedia-cs-mcp": {
     "type": "stdio",
-    "command": "D:/src/liquipedia-mcp/.venv/Scripts/python.exe",
-    "args": ["-m", "app.stdio"]
+    "command": "uvx",
+    "args": ["--from", "git+https://github.com/OldGeorsk/liquipedia-cs-mcp", "liquipedia-cs-mcp"],
+    "env": {"LIQUIPEDIA_CONTACT": "you@example.com"}
   }
 }
 ```
 
-macOS/Linux 下 command 为 `<克隆路径>/.venv/bin/python`。
+用 pip——`pip install git+https://github.com/OldGeorsk/liquipedia-cs-mcp`,然后使用安装出的 `liquipedia-cs-mcp` 命令(不在 PATH 时填环境的 `bin`/`Scripts` 绝对路径)。数据库位于 `~/.liquipedia-cs-mcp/`。
+
+克隆仓库(开发)——`pip install -e .` 后注册 `python -m app.stdio`;相对的 `data/` 与 `.env` 保留在克隆内。
 
 - **ZCode** — `~/.zcode/cli/config.json` → `mcp.servers`
 - **Claude Desktop / Cursor** — 客户端的 `mcpServers` 配置
-- **Codex CLI** — `~/.codex/config.toml` → `[mcp_servers.liquipedia-cs-mcp]`,填入相同的 `command`/`args`
+- **Codex CLI** — `~/.codex/config.toml` → `[mcp_servers.liquipedia-cs-mcp]`,填入相同字段
 
 进阶用法(多客户端共享一个常驻实例,也是 ChatGPT 桌面版连接器唯一可用的模式):运行
-`.venv/Scripts/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000`,改为注册 `{"type": "http", "url": "http://127.0.0.1:8000/mcp"}`。限流以单进程协调最佳,请避免 stdio 与 HTTP 实例同时高频使用。
-
-> 不想手动配置?把下面这句话直接丢给你的 agent:
-> "把 D:/src/liquipedia-mcp 下的 stdio MCP 服务器(command: .venv/Scripts/python.exe,args: -m app.stdio)注册到我的 MCP 客户端,并验证连接。"
+`python -m uvicorn app.main:app --host 127.0.0.1 --port 8000`,改为注册 `{"type": "http", "url": "http://127.0.0.1:8000/mcp"}`。限流以单进程协调最佳,请避免 stdio 与 HTTP 实例同时高频使用。
 
 ## MCP 工具
 
@@ -59,7 +60,7 @@ macOS/Linux 下 command 为 `<克隆路径>/.venv/bin/python`。
 
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |
-| `LIQUIPEDIA_CONTACT` | *(在 `.env` 中设置)* | User-Agent 中必需的联系方式 |
+| `LIQUIPEDIA_CONTACT` | *(占位符)* | User-Agent 中必需的联系方式;经客户端 env 配置设置(克隆内可用 `.env`) |
 | `LIQUIPEDIA_CACHE_TTL_SECONDS` | `86400` | 页面缓存有效期(秒) |
 | `LIQUIPEDIA_PAGE_BUDGET_PER_JOB` | `30` | 每个查询任务的新页面抓取上限 |
 | `LIQUIPEDIA_JOB_STALL_SECONDS` | `60` | 无心跳超过该秒数后,孤儿任务转为 `failed` / `job_stalled` |

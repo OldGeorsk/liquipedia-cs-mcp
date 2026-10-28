@@ -1,4 +1,4 @@
-# liquipedia-cs-mcp (v0.6.0)
+# liquipedia-cs-mcp (v0.7.0)
 English | [简体中文](README.zh-CN.md)
 
 - Local MCP server that looks up Counter-Strike teams and players on [Liquipedia](https://liquipedia.net/counterstrike):
@@ -8,36 +8,37 @@ English | [简体中文](README.zh-CN.md)
 - a team's full tournament record (`/Results` history) with per-tier summaries, plus a generic `search_wiki` / `read_wiki_page` fallback that reaches any wiki page when no dedicated tool fits;
 - wrong resource types (a team page passed to a player tool, or the reverse) return `isError` with a machine-readable code and the right alternative instead of an empty success.
 
-## Install
+## Install & register (stdio — the client spawns the server, no port)
 
-```bash
-python -m venv .venv
-.venv/Scripts/pip install -e .             # Windows; use .venv/bin/pip elsewhere
-```
+The one-liner way — paste this to any agent:
 
-Register as a **stdio** server — the client spawns and manages the process itself: no port, no manual start. Replace `D:/src/liquipedia-mcp` with your clone path:
+> "Install the Liquipedia CS MCP server from https://github.com/OldGeorsk/liquipedia-cs-mcp (pip install git+https://github.com/OldGeorsk/liquipedia-cs-mcp, or run via uvx), register it as a stdio MCP server named `liquipedia-cs-mcp` with env `LIQUIPEDIA_CONTACT=<my email>`, then verify the connection."
+
+Manual config snippets:
+
+With [uv](https://docs.astral.sh/uv/) — no venv juggling (add `--refresh` in args to pick up new commits):
 
 ```json
 {
   "liquipedia-cs-mcp": {
     "type": "stdio",
-    "command": "D:/src/liquipedia-mcp/.venv/Scripts/python.exe",
-    "args": ["-m", "app.stdio"]
+    "command": "uvx",
+    "args": ["--from", "git+https://github.com/OldGeorsk/liquipedia-cs-mcp", "liquipedia-cs-mcp"],
+    "env": {"LIQUIPEDIA_CONTACT": "you@example.com"}
   }
 }
 ```
 
-On macOS/Linux the command is `<clone>/.venv/bin/python`.
+With pip — `pip install git+https://github.com/OldGeorsk/liquipedia-cs-mcp`, then use the installed `liquipedia-cs-mcp` command (absolute path to your env's `bin`/`Scripts` when it is not on PATH). The database lands in `~/.liquipedia-cs-mcp/`.
+
+From a clone (development) — `pip install -e .` and register `python -m app.stdio`; relative `data/` and `.env` stay inside the clone.
 
 - **ZCode** — `~/.zcode/cli/config.json` → `mcp.servers`
 - **Claude Desktop / Cursor** — the client's `mcpServers` config
-- **Codex CLI** — `~/.codex/config.toml` → `[mcp_servers.liquipedia-cs-mcp]` with the same `command`/`args`
+- **Codex CLI** — `~/.codex/config.toml` → `[mcp_servers.liquipedia-cs-mcp]` with the same fields
 
 Advanced (one shared instance for many clients, and the only mode ChatGPT desktop connectors can use): run
-`.venv/Scripts/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000` and register `{"type": "http", "url": "http://127.0.0.1:8000/mcp"}` instead. Rate limiting coordinates through one process, so avoid heavy concurrent use of stdio and HTTP instances at the same time.
-
-> Too lazy to configure? Just hand this to your agent:
-> "Register the stdio MCP server at D:/src/liquipedia-mcp (command: .venv/Scripts/python.exe, args: -m app.stdio) in my MCP client, then verify the connection."
+`python -m uvicorn app.main:app --host 127.0.0.1 --port 8000` and register `{"type": "http", "url": "http://127.0.0.1:8000/mcp"}` instead. Rate limiting coordinates through one process, so avoid heavy concurrent use of stdio and HTTP instances at the same time.
 
 ## MCP tools
 
@@ -59,7 +60,7 @@ Advanced (one shared instance for many clients, and the only mode ChatGPT deskto
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `LIQUIPEDIA_CONTACT` | *(set in `.env`)* | required contact in the User-Agent |
+| `LIQUIPEDIA_CONTACT` | *(placeholder)* | required contact in the User-Agent; set via the client's env config (or `.env` in a clone) |
 | `LIQUIPEDIA_CACHE_TTL_SECONDS` | `86400` | page cache freshness |
 | `LIQUIPEDIA_PAGE_BUDGET_PER_JOB` | `30` | fresh pages per lookup job |
 | `LIQUIPEDIA_JOB_STALL_SECONDS` | `60` | no-heartbeat threshold before an orphaned job becomes `failed` / `job_stalled` |

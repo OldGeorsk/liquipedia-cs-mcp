@@ -12,22 +12,29 @@
 ```bash
 python -m venv .venv
 .venv/Scripts/pip install -e .             # Windows;其他系统使用 .venv/bin/pip
-.venv/Scripts/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-在你的 MCP 客户端中注册 `http://127.0.0.1:8000/mcp`(Streamable HTTP):
+注册为 **stdio** 服务器——客户端自行拉起并托管进程:不占端口、无需手动启动。把 `D:/src/liquipedia-mcp` 替换为你的克隆路径:
+
+```json
+{
+  "liquipedia-cs-mcp": {
+    "type": "stdio",
+    "command": "D:/src/liquipedia-mcp/.venv/Scripts/python.exe",
+    "args": ["-m", "app.stdio"]
+  }
+}
+```
 
 - **ZCode** — `~/.zcode/cli/config.json` → `mcp.servers`
 - **Claude Desktop / Cursor** — 客户端的 `mcpServers` 配置
-- **Codex CLI** — `~/.codex/config.toml` → `[mcp_servers.liquipedia-cs-mcp]`,填入相同的 `url`
-- **ChatGPT 桌面版** — 设置 → Connectors → Advanced → 开启 Developer mode → 添加连接器
+- **Codex CLI** — `~/.codex/config.toml` → `[mcp_servers.liquipedia-cs-mcp]`,填入相同的 `command`/`args`
 
-```json
-{ "liquipedia-cs-mcp": { "type": "http", "url": "http://127.0.0.1:8000/mcp" } }
-```
+进阶用法(多客户端共享一个常驻实例,也是 ChatGPT 桌面版连接器唯一可用的模式):运行
+`.venv/Scripts/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000`,改为注册 `{"type": "http", "url": "http://127.0.0.1:8000/mcp"}`。限流以单进程协调最佳,请避免 stdio 与 HTTP 实例同时高频使用。
 
 > 不想手动配置?把下面这句话直接丢给你的 agent:
-> "把本地 HTTP MCP 服务器 http://127.0.0.1:8000/mcp 注册到我的 MCP 客户端,并验证连接。"
+> "把 D:/src/liquipedia-mcp 下的 stdio MCP 服务器(command: .venv/Scripts/python.exe,args: -m app.stdio)注册到我的 MCP 客户端,并验证连接。"
 
 ## MCP 工具
 

@@ -12,22 +12,29 @@ English | [简体中文](README.zh-CN.md)
 ```bash
 python -m venv .venv
 .venv/Scripts/pip install -e .             # Windows; use .venv/bin/pip elsewhere
-.venv/Scripts/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Register `http://127.0.0.1:8000/mcp` (Streamable HTTP) in your MCP client:
+Register as a **stdio** server — the client spawns and manages the process itself: no port, no manual start. Replace `D:/src/liquipedia-mcp` with your clone path:
+
+```json
+{
+  "liquipedia-cs-mcp": {
+    "type": "stdio",
+    "command": "D:/src/liquipedia-mcp/.venv/Scripts/python.exe",
+    "args": ["-m", "app.stdio"]
+  }
+}
+```
 
 - **ZCode** — `~/.zcode/cli/config.json` → `mcp.servers`
 - **Claude Desktop / Cursor** — the client's `mcpServers` config
-- **Codex CLI** — `~/.codex/config.toml` → `[mcp_servers.liquipedia-cs-mcp]` with the same `url`
-- **ChatGPT desktop** — Settings → Connectors → Advanced → enable Developer mode → Add connector
+- **Codex CLI** — `~/.codex/config.toml` → `[mcp_servers.liquipedia-cs-mcp]` with the same `command`/`args`
 
-```json
-{ "liquipedia-cs-mcp": { "type": "http", "url": "http://127.0.0.1:8000/mcp" } }
-```
+Advanced (one shared instance for many clients, and the only mode ChatGPT desktop connectors can use): run
+`.venv/Scripts/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000` and register `{"type": "http", "url": "http://127.0.0.1:8000/mcp"}` instead. Rate limiting coordinates through one process, so avoid heavy concurrent use of stdio and HTTP instances at the same time.
 
 > Too lazy to configure? Just hand this to your agent:
-> "Install and register the local HTTP MCP server at http://127.0.0.1:8000/mcp in my MCP client, then verify the connection."
+> "Register the stdio MCP server at D:/src/liquipedia-mcp (command: .venv/Scripts/python.exe, args: -m app.stdio) in my MCP client, then verify the connection."
 
 ## MCP tools
 

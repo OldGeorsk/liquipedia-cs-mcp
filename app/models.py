@@ -207,6 +207,67 @@ class TeamSearchResult(BaseModel):
     candidates: list[TeamCandidate] = Field(default_factory=list)
 
 
+class AchievementEntry(BaseModel):
+    """One row of a team's /Results table, as rendered by LPDB."""
+
+    date: str | None = None
+    place: str
+    tier: str                     # S-Tier / A-Tier / B-Tier / Qualifier ...
+    type: str | None = None       # Offline / Online
+    tournament: str
+    score: str | None = None      # e.g. "3 : 0"; group stages may be "0/2"
+    opponent: str | None = None   # may be a group label like "Grp S."
+    prize: float | None = None    # USD; None when not a plain number
+
+
+class TierSummary(BaseModel):
+    """Placements over the returned (possibly tier-filtered) rows."""
+
+    tier: str
+    events: int
+    wins: int = 0                 # place exactly "1st"
+    runner_up: int = 0            # place exactly "2nd"
+    top4: int = 0                 # places 1st/2nd/3rd/4th incl. "3rd - 4th"
+    prize_total: float = 0.0
+
+
+class TeamAchievementsResult(BaseModel):
+    """The payload of get_team_achievements."""
+
+    team: TeamInfo
+    tier_filter: str | None = None
+    results: list[AchievementEntry] = Field(default_factory=list)
+    stats: list[TierSummary] = Field(default_factory=list)
+
+
+class WikiHit(BaseModel):
+    """One page returned by the generic search_wiki fallback."""
+
+    title: str
+    page_id: int | None = None
+    url: str
+    snippet: str = ""
+
+
+class WikiSearchResult(BaseModel):
+    """The payload of search_wiki: any page type, unfiltered."""
+
+    query: str
+    hits: list[WikiHit] = Field(default_factory=list)
+
+
+class WikiPageResult(BaseModel):
+    """The payload of read_wiki_page: raw content, capped for transport."""
+
+    title: str
+    page_id: int | None = None
+    format: str                   # "wikitext" | "html"
+    section: str | None = None
+    content: str
+    content_chars: int
+    truncated: bool
+
+
 class OverlapWindow(BaseModel):
     """Verified overlap between two stints (PRD feature 2)."""
 
@@ -332,7 +393,8 @@ class Envelope(BaseModel):
     player_id: str | None = None
     result: (
         NetworkResult | CareerResult | RelationshipResult | TeamRosterResult
-        | TeamSearchResult | MatrixResult | None
+        | TeamSearchResult | MatrixResult | TeamAchievementsResult
+        | WikiSearchResult | WikiPageResult | None
     ) = None
     progress: str | None = None
     fetched_at: datetime | None = None

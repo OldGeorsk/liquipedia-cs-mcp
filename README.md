@@ -48,6 +48,9 @@ Advanced (one shared instance for many clients, and the only mode ChatGPT deskto
 | `get_player_career` | `player_id` | full recorded team history: every stint with game tag (CS / CS:GO / CS2), dates at recorded precision, stint identity, rename-resolved teams |
 | `get_player_relationship` | `player_a`, `player_b`, `include_non_overlapping` | overlapping shared stints (`confirmed` / `unconfirmed`), playing identities, explicitly stated kinship; non-overlapping stints are counted in `omitted` and hidden by default |
 | `get_relationship_matrix` | `teams` (2–5) or `players` (2–20), `include_staff`, `include_non_overlapping`, `max_pairs` (1–500) | one call compares every cross-team pair: `connections[]`, `same_team_no_overlap[]`, `stats`, `skipped[]`; invalid teams fail the whole call, a missing player page yields `partial` |
+| `get_team_achievements` | `team_id`, `tier` (optional, e.g. `S-Tier` or `S`) | full tournament record from the team's `/Results` subpage: every row with date/placement/tier/tournament/score/opponent/prize, plus per-tier summaries (events/wins/runner-up/top4/prize) |
+| `search_wiki` | `query`, `limit` (1–20) | unfiltered full-text search over any page type — the fallback when dedicated tools miss |
+| `read_wiki_page` | `page`, `format` (`wikitext`/`html`), `section` | raw content of any page including subpages, capped at 40k chars; `html` is required for LPDB-generated tables (results, statistics) |
 
 ## Configuration (env vars, `LIQUIPEDIA_` prefix)
 

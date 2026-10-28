@@ -23,6 +23,11 @@ _INSTRUCTIONS = (
     "in one call. "
     "Player tools reject team/tournament pages with isError and a concrete "
     "alternative; never treat an error as an empty result. "
+    "get_team_achievements returns a team's full tournament record with "
+    "per-tier summaries. "
+    "search_wiki plus read_wiki_page are the fallback path: search any page "
+    "type, then read its raw wikitext or rendered HTML when no dedicated "
+    "tool covers the question. "
     f"All text data is {LICENSE_NAME} via Liquipedia."
 )
 
@@ -53,6 +58,7 @@ def _input_error(envelope: Envelope) -> CallToolResult | None:
         and envelope.error is not None
         and envelope.error.code in {
             "invalid_resource_type", "page_missing", "same_player",
+            "results_page_missing",
         }
     ):
         return _tool_error(envelope.error)
@@ -148,6 +154,76 @@ def build_server(
             envelope = await service.roster(team_id.strip(), include_staff)
         except InvalidResource as exc:
             return _tool_error(exc.as_error())
+        if (error := _input_error(envelope)) is not None:
+            return error
+        return _text(envelope.model_dump_json(indent=2))
+
+    @server.tool()
+    async def get_team_achievements(
+        team_id: str, tier: str | None = None,
+    ) -> CallToolResult:
+        """Return a team's full tournament record from its /Results subpage.
+
+        `team_id` is the team page title (for example `Team Falcons`). Every
+        recorded row comes back with date, placement, tier, type, tournament,
+        score, opponent and prize, plus per-tier summaries (events / wins /
+        runner-up / top4 / prize total). `tier` filters rows, e.g. "S-Tier"
+        or just "S". The table is generated server-side, so a cold call uses
+        the expensive parse lane and may wait ~30s of rate-limit spacing;
+        later calls come from cache.
+        """
+        if not team_id or not team_id.strip():
+            return _invalid_argument("team_id must be a non-empty string")
+        if tier is not None and not tier.strip():
+            return _invalid_argument("tier must be a non-empty string when given")
+        try:
+            envelope = await service.achievements(
+                team_id.strip(), tier.strip() if tier else None,
+            )
+        except InvalidResource as exc:
+            return _tool_error(exc.as_error())
+        if (error := _input_error(envelope)) is not None:
+            return error
+        return _text(envelope.model_dump_json(indent=2))
+
+    @server.tool()
+    async def search_wiki(query: str, limit: int = 10) -> CallToolResult:
+        """Generic full-text search over the wiki: any page type, unfiltered.
+
+        The fallback when dedicated tools miss — tournaments, patches, org
+        pages and subpages all come back as {title, url, snippet} hits.
+        Use read_wiki_page on a hit to get the content itself.
+        """
+        if not query or not query.strip():
+            return _invalid_argument("query must be a non-empty string")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 20:
+            return _invalid_argument("limit must be an integer between 1 and 20")
+        envelope = await service.wiki_search(query.strip(), limit)
+        if envelope.status == JobStatus.FAILED and envelope.error is not None:
+            return _tool_error(envelope.error)
+        return _text(envelope.model_dump_json(indent=2))
+
+    @server.tool()
+    async def read_wiki_page(
+        title: str, format: str = "wikitext", section: str | None = None,
+    ) -> CallToolResult:
+        """Read raw content of any wiki page — the escape hatch.
+
+        `format` is "wikitext" (default, cached, cheap) or "html" (rendered;
+        required for LPDB-generated tables such as results or statistics).
+        `section` extracts one section by name or index. Content is capped
+        at 40,000 characters; `truncated` flags longer pages. No
+        resource-type validation: any page is readable, including subpages.
+        """
+        if not title or not title.strip():
+            return _invalid_argument("title must be a non-empty string")
+        if format not in {"wikitext", "html"}:
+            return _invalid_argument('format must be "wikitext" or "html"')
+        if section is not None and not section.strip():
+            return _invalid_argument("section must be non-empty when given")
+        envelope = await service.read_wiki_page(
+            title.strip(), fmt=format, section=(section.strip() if section else None),
+        )
         if (error := _input_error(envelope)) is not None:
             return error
         return _text(envelope.model_dump_json(indent=2))

@@ -48,6 +48,9 @@ python -m venv .venv
 | `get_player_career` | `player_id` | 完整战队履历:每段效力的游戏标签(CS / CS:GO / CS2)、原始精度的日期、身份标注、改名归一后的战队名 |
 | `get_player_relationship` | `player_a`、`player_b`、`include_non_overlapping` | 有重叠的共同效力区间(`confirmed` / `unconfirmed`)、双方当时身份、明文记载的亲属关系;无重叠的碎片默认隐藏,仅计入 `omitted` |
 | `get_relationship_matrix` | `teams`(2–5)或 `players`(2–20)、`include_staff`、`include_non_overlapping`、`max_pairs`(1–500) | 一次调用比较全部跨队 pair:输出 `connections[]`、`same_team_no_overlap[]`、`stats`、`skipped[]`;队伍无效则整次失败,个别选手页缺失返回 `partial` |
+| `get_team_achievements` | `team_id`、`tier`(可选,如 `S-Tier` 或 `S`) | 队伍 `/Results` 子页的完整赛事战绩:每行含日期/名次/级别/赛事/比分/对手/奖金,并附按级别汇总(场次/冠军/亚军/四强/总奖金) |
+| `search_wiki` | `query`、`limit`(1–20) | 不过滤页面类型的全站全文搜索——专用工具未覆盖时的保底入口 |
+| `read_wiki_page` | `page`、`format`(`wikitext`/`html`)、`section` | 任意页面(含子页)的原始内容,上限 4 万字符;LPDB 生成的表格(成绩、统计)需用 `html` |
 
 ## 配置(环境变量,`LIQUIPEDIA_` 前缀)
 

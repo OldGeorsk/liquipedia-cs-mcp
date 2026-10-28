@@ -50,6 +50,18 @@ class PageContent:
 
 
 @dataclass
+class ParsedPage:
+    """Server-rendered output of action=parse for one page."""
+
+    title: str
+    page_id: int | None
+    content: str          # rendered HTML (prop=text) or expanded wikitext
+    revision_id: int | None
+    fetched_at: datetime
+    from_cache: bool
+
+
+@dataclass
 class BatchResult:
     """Outcome of a batched page fetch."""
 
@@ -142,6 +154,44 @@ class LiquipediaClient:
             result.missing.update(chunk_missing)
             result.fresh_pages.update(chunk_fresh)
         return result
+
+    async def parse_page(
+        self, title: str, prop: str = "text", section: str | int | None = None,
+    ) -> ParsedPage:
+        """Rendered page via action=parse — the only source for LPDB content.
+
+        Tables such as team results are generated server-side and never
+        appear in raw wikitext, so some pages must be fetched rendered.
+        Parse requests are expensive upstream and use the scheduler's
+        parse lane; output is cached under a derived key like any page.
+        """
+        cache_key = f"{title}\x1f{prop}\x1f{section if section is not None else ''}"
+        cached = self._store.get_page(cache_key)
+        if cached and self._is_fresh(cached):
+            return ParsedPage(
+                title=cached["title"], page_id=cached["page_id"],
+                content=cached["wikitext"], revision_id=cached["revision_id"],
+                fetched_at=datetime.fromisoformat(cached["fetched_at"]),
+                from_cache=True,
+            )
+        params = {"action": "parse", "page": title, "prop": prop,
+                  "format": "json"}
+        if section is not None:
+            params["section"] = str(section)
+        data = await self._request(params, lane="parse")
+        parsed = data.get("parse", {})
+        body = parsed.get("text", parsed.get("wikitext", {}))
+        content = body.get("*", "")
+        fetched_at = datetime.now(timezone.utc)
+        self._store.save_page(
+            cache_key, parsed.get("pageid"), content,
+            parsed.get("revid"), fetched_at,
+        )
+        return ParsedPage(
+            title=parsed.get("title", title), page_id=parsed.get("pageid"),
+            content=content, revision_id=parsed.get("revid"),
+            fetched_at=fetched_at, from_cache=False,
+        )
 
     async def _fetch_wikitext(self, title: str) -> PageContent:
         params = {
@@ -248,8 +298,8 @@ class LiquipediaClient:
         now = datetime.now(timezone.utc).timestamp()
         return now - fetched <= self._settings.cache_ttl_seconds
 
-    async def _request(self, params: dict[str, str]) -> dict:
-        await self._scheduler.acquire()  # every upstream call starts here
+    async def _request(self, params: dict[str, str], lane: str = "standard") -> dict:
+        await self._scheduler.acquire(lane)  # every upstream call starts here
         response = await self._http.get(
             self._settings.api_url, params=params,
             headers={"User-Agent": self._settings.user_agent},

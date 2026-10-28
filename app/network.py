@@ -7,22 +7,25 @@ are free, which is what makes budget-exhausted jobs cheap to resume.
 
 import asyncio
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from html import unescape
 
 from app.config import Settings
 from app.liquipedia import (
     LiquipediaClient, PageContent, ProviderError, RateLimited, page_url,
 )
 from app.models import (
-    CareerResult, CareerStint, Envelope, ErrorInfo, JobStatus, KinshipRecord,
-    MatrixConnection, MatrixResult, MatrixStats, MatrixTeam, NetworkResult,
-    OmittedRecords, OverlapWindow, Player, PreviousTeamGroup,
-    RelationConfidence, RelationshipResult, RosterMember, RosterRelation,
-    SameTeamNoOverlap, SharedTeamRecord, SkippedPlayer, Source, StaffMember,
-    TeamCandidate, TeamInfo, TeamRosterResult, TeamSearchResult, TeamStatus,
-    Teammate,
+    AchievementEntry, CareerResult, CareerStint, Envelope, ErrorInfo,
+    JobStatus, KinshipRecord, MatrixConnection, MatrixResult, MatrixStats,
+    MatrixTeam, NetworkResult, OmittedRecords, OverlapWindow, Player,
+    PreviousTeamGroup, RelationConfidence, RelationshipResult, RosterMember,
+    RosterRelation, SameTeamNoOverlap, SharedTeamRecord, SkippedPlayer,
+    Source, StaffMember, TeamAchievementsResult, TeamCandidate, TeamInfo,
+    TeamRosterResult, TeamSearchResult, TeamStatus, Teammate, TierSummary,
+    WikiHit, WikiPageResult, WikiSearchResult,
 )
 from app.parsing import (
     SquadEntry, classify_page, date_bounds, first_active_squad, name_key,
@@ -30,6 +33,18 @@ from app.parsing import (
     parse_team_history, recent_previous_teams, scan_kinships,
 )
 from app.store import Store
+
+# Safety caps for raw/derived content (transport-friendliness, not policy).
+_RESULT_ROW_CAP = 500       # achievement rows returned per call
+_RAW_CONTENT_CAP = 40_000   # characters of raw page content per call
+
+
+def _money(raw: str) -> float | None:
+    """'$111,562.50' -> 111562.5; anything unparsable -> None."""
+    try:
+        return float(raw.replace("$", "").replace(",", ""))
+    except ValueError:
+        return None
 
 
 class _BudgetExhausted(Exception):
@@ -377,6 +392,173 @@ class PlayerNetworkService:
                 roster=roster, staff=staff,
             ),
             fetched_at=page.fetched_at, sources=sources, warnings=warnings,
+        )
+
+    async def achievements(self, team_id: str, tier: str | None = None) -> Envelope:
+        """Full tournament record of one team (PRD 2026-10-28 P0-01).
+
+        Result tables are generated server-side from LPDB, so the
+        `<team>/Results` subpage is fetched rendered and parsed as HTML;
+        raw wikitext holds no data. ``tier`` ("S-Tier" or just "S") filters
+        rows before summarising.
+        """
+        team_id = team_id.strip()
+        try:
+            page = await self._fetch(team_id, None)
+        except RateLimited as exc:
+            return Envelope(
+                status=JobStatus.FAILED,
+                error=ErrorInfo(code="rate_limited", message=str(exc), given=team_id),
+            )
+        except ProviderError as exc:
+            return Envelope(
+                status=JobStatus.FAILED,
+                error=ErrorInfo(code=exc.code, message=str(exc), given=team_id),
+            )
+        self._require_team(page, team_id)
+
+        try:
+            rendered = await self._client.parse_page(
+                f"{page.title}/Results", prop="text",
+            )
+        except RateLimited as exc:
+            return Envelope(
+                status=JobStatus.FAILED,
+                error=ErrorInfo(code="rate_limited", message=str(exc), given=team_id),
+            )
+        except ProviderError as exc:
+            return Envelope(
+                status=JobStatus.FAILED,
+                error=ErrorInfo(
+                    code="results_page_missing",
+                    message=f"no /Results subpage for {page.title}: {exc}",
+                    given=team_id,
+                    suggestion=(
+                        f'use read_wiki_page(page="{page.title}", format="html")'
+                    ),
+                ),
+            )
+
+        want = self._tier_filter(tier)
+        rows = self._parse_result_rows(rendered.content)
+        warnings: list[str] = []
+        if want is not None:
+            rows = [r for r in rows if r["tier"].lower() == want.lower()]
+            if not rows:
+                warnings.append(f"no results recorded for tier {want}")
+        truncated = len(rows) > _RESULT_ROW_CAP
+        if truncated:
+            rows = rows[:_RESULT_ROW_CAP]
+            warnings.append(f"result rows capped at {_RESULT_ROW_CAP}")
+        entries = [AchievementEntry(**row) for row in rows]
+        return Envelope(
+            status=JobStatus.COMPLETE,
+            result=TeamAchievementsResult(
+                team=TeamInfo(
+                    name=page.title, page_id=page.page_id,
+                    url=page_url(self._settings, page.title),
+                ),
+                tier_filter=want,
+                results=entries,
+                stats=self._summarize_tiers(entries),
+            ),
+            fetched_at=rendered.fetched_at,
+            sources=[
+                self._source_of_page(page),
+                Source(
+                    page=f"{page.title}/Results", page_id=rendered.page_id,
+                    url=page_url(self._settings, f"{page.title}/Results"),
+                    revision_id=rendered.revision_id,
+                    fetched_at=rendered.fetched_at,
+                ),
+            ],
+            warnings=warnings,
+            truncated=truncated,
+        )
+
+    async def wiki_search(self, query: str, limit: int = 10) -> Envelope:
+        """Generic namespace-0 full-text search, any page type (PRD P1-01).
+
+        Unlike search_players / search_teams nothing is filtered: the point
+        is coverage, so tournaments, patches or subpages all come back.
+        """
+        query = query.strip()
+        try:
+            hits = await self._client.search(query, limit)
+        except RateLimited as exc:
+            return Envelope(
+                status=JobStatus.FAILED,
+                error=ErrorInfo(code="rate_limited", message=str(exc), given=query),
+            )
+        except ProviderError as exc:
+            return Envelope(
+                status=JobStatus.FAILED,
+                error=ErrorInfo(code=exc.code, message=str(exc), given=query),
+            )
+        return Envelope(
+            status=JobStatus.COMPLETE,
+            result=WikiSearchResult(
+                query=query,
+                hits=[
+                    WikiHit(
+                        title=hit.title, page_id=hit.page_id,
+                        url=page_url(self._settings, hit.title),
+                        snippet=hit.snippet,
+                    )
+                    for hit in hits
+                ],
+            ),
+        )
+
+    async def read_wiki_page(
+        self, title: str, fmt: str = "wikitext",
+        section: str | int | None = None,
+    ) -> Envelope:
+        """Raw page content for any page, including subpages (PRD P1-02).
+
+        The escape hatch for questions the dedicated tools do not cover.
+        Wikitext uses the normal cached path; rendered HTML and any section
+        extraction need action=parse and ride the parse lane. Content is
+        capped at _RAW_CONTENT_CAP characters with a truncated flag.
+        """
+        title = title.strip()
+        try:
+            if fmt == "html" or section is not None:
+                parsed = await self._client.parse_page(
+                    title, prop=("text" if fmt == "html" else "wikitext"),
+                    section=section,
+                )
+                content, meta = parsed.content, parsed
+            else:
+                page = await self._client.get_wikitext(title)
+                content, meta = page.wikitext, page
+        except RateLimited as exc:
+            return Envelope(
+                status=JobStatus.FAILED,
+                error=ErrorInfo(code="rate_limited", message=str(exc), given=title),
+            )
+        except ProviderError as exc:
+            code = "page_missing" if exc.code == "missingtitle" else exc.code
+            return Envelope(
+                status=JobStatus.FAILED,
+                error=ErrorInfo(code=code, message=str(exc), given=title),
+            )
+        truncated = len(content) > _RAW_CONTENT_CAP
+        return Envelope(
+            status=JobStatus.COMPLETE,
+            result=WikiPageResult(
+                title=meta.title, page_id=meta.page_id, format=fmt,
+                section=str(section) if section is not None else None,
+                content=content[:_RAW_CONTENT_CAP],
+                content_chars=min(len(content), _RAW_CONTENT_CAP),
+                truncated=truncated,
+            ),
+            fetched_at=meta.fetched_at,
+            sources=[Source(
+                page=meta.title, page_id=meta.page_id,
+                url=page_url(self._settings, meta.title),
+                revision_id=meta.revision_id, fetched_at=meta.fetched_at,
+            )],
         )
 
     async def relationship(
@@ -1146,6 +1328,71 @@ class PlayerNetworkService:
                 f'use search_teams(query="{given}") to resolve the page title first'
             )
         raise InvalidResource(given, kind, "team", suggestion)
+
+    # Rendered /Results rows: class attributes arrive HTML-escaped, so the
+    # row class is matched with the entity form or a plain underscore.
+    _RESULT_ROW = re.compile(
+        r'<tr[^>]*class="table2(?:&#95;|_){2}row--body[^"]*">(.*?)</tr>', re.S,
+    )
+    _RESULT_CELL = re.compile(r"<td[^>]*>(.*?)</td>", re.S)
+    _HTML_TAG = re.compile(r"<[^>]+>")
+
+    @staticmethod
+    def _tier_filter(raw: str | None) -> str | None:
+        """Normalise user input to the wiki's tier labels ("S" -> "S-Tier")."""
+        if raw is None or not raw.strip():
+            return None
+        t = raw.strip()
+        if t.lower() in {"s", "a", "b"}:
+            return t.upper() + "-Tier"
+        return t
+
+    @staticmethod
+    def _parse_result_rows(html: str) -> list[dict]:
+        """Rows of an LPDB results table as plain cell values.
+
+        Cell order: date, place, tier, type, game, icon, tournament, score,
+        opponent, prize. The two icon cells render empty on the API output.
+        """
+        rows: list[dict] = []
+        for row in PlayerNetworkService._RESULT_ROW.findall(html):
+            cells = [
+                re.sub(
+                    r"\s+", " ",
+                    unescape(PlayerNetworkService._HTML_TAG.sub(" ", cell)),
+                ).strip()
+                for cell in PlayerNetworkService._RESULT_CELL.findall(row)
+            ]
+            if len(cells) < 10 or not cells[0][:4].isdigit():
+                continue
+            rows.append({
+                "date": cells[0] or None,
+                "place": cells[1],
+                "tier": cells[2],
+                "type": cells[3] or None,
+                "tournament": cells[6],
+                "score": cells[7] or None,
+                "opponent": cells[8] or None,
+                "prize": _money(cells[9]),
+            })
+        return rows
+
+    @staticmethod
+    def _summarize_tiers(entries: list[AchievementEntry]) -> list[TierSummary]:
+        """Per-tier placement counts over the returned rows, biggest first."""
+        by: dict[str, TierSummary] = {}
+        for entry in entries:
+            summary = by.setdefault(entry.tier, TierSummary(tier=entry.tier, events=0))
+            summary.events += 1
+            if entry.place == "1st":
+                summary.wins += 1
+            elif entry.place == "2nd":
+                summary.runner_up += 1
+            if entry.place in {"1st", "2nd", "3rd", "4th", "3rd - 4th"}:
+                summary.top4 += 1
+            if entry.prize is not None:
+                summary.prize_total += entry.prize
+        return sorted(by.values(), key=lambda s: -s.events)
 
     @staticmethod
     def _row_title(row: SquadEntry) -> str:

@@ -3,7 +3,7 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 APP_NAME = "liquipedia-cs-mcp"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 
 # Liquipedia text is CC BY-SA 3.0; every result must carry this attribution.
 LICENSE_NAME = "CC BY-SA 3.0"

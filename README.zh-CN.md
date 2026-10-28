@@ -1,4 +1,4 @@
-# liquipedia-cs-mcp
+# liquipedia-cs-mcp (v0.6.0)
 [English](README.md) | 简体中文
 
 - 本地 MCP 服务器,用于在 [Liquipedia](https://liquipedia.net/counterstrike) 上查询反恐精英(Counter-Strike)战队与选手:
